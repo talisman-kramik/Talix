@@ -1,0 +1,65 @@
+{
+  "expo": {
+    "name": "Talix",
+    "slug": "talix",
+    "scheme": ["talix", "msauth.com.talismansolutions.talix"],
+    "version": "1.0.0",
+    "orientation": "default",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.talismansolutions.talix",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMicrophoneUsageDescription": "Talix needs microphone access to record medical encounters for transcription.",
+        "NSFaceIDUsageDescription": "Talix needs Face ID / Biometrics to securely authenticate and log you in.",
+        "NSAppTransportSecurity": {
+          "NSExceptionDomains": {
+            "98.88.67.46": {
+              "NSExceptionAllowsInsecureHTTPLoads": true,
+              "NSIncludesSubdomains": true
+            }
+          }
+        }
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#00B27A",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "package": "com.talismansolutions.talix",
+      "permissions": ["RECORD_AUDIO"]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Talix needs microphone access to record medical encounters."
+        }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Allow Talix to use Face ID / Biometrics to authenticate you."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "8c7f14a9-3fb7-4eb6-a1fa-710ea194f90c"
+      }
+    }
+  }
+}
