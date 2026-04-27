@@ -15,44 +15,60 @@ import { useAuthStore } from "../store/auth";
 
 WebBrowser.maybeCompleteAuthSession();
 
-// ── Microsoft Entra ID Configuration ──────────────────────────────────
-const TENANT_ID = process.env.EXPO_PUBLIC_AZURE_TENANT_ID || "common";
-const CLIENT_ID = process.env.EXPO_PUBLIC_AZURE_CLIENT_ID || "";
+// ── Organization Configurations ───────────────────────────────────────
+const ORGANIZATIONS = [
+  {
+    id: "talisman",
+    name: "Talisman Solutions",
+    clientId: process.env.EXPO_PUBLIC_AZURE_CLIENT_ID || "",
+    tenantId: process.env.EXPO_PUBLIC_AZURE_TENANT_ID || "",
+  },
+  {
+    id: "excelsiainjury",
+    name: "Excelsiainjurycare",
+    clientId: process.env.EXPO_PUBLIC_EXCELSIAINJURY_CLIENT_ID || "",
+    tenantId: process.env.EXPO_PUBLIC_EXCELSIAINJURY_TENANT_ID || "",
+  },
+];
+
 const SCOPES = ["openid", "profile", "email", "User.Read"];
 
-// Microsoft v2.0 OAuth endpoints for this tenant
-const discovery: AuthSession.DiscoveryDocument = {
-  authorizationEndpoint: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize`,
-  tokenEndpoint: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
-};
-
-// ── Redirect URI ──────────────────────────────────────────────────────
 const redirectUri = AuthSession.makeRedirectUri({
-  scheme: "msauth.com.talismansolutions.talix",
+  scheme: "msauth.com.talismansolutions.talixapp",
   path: "auth",
 });
 
 export default function LoginScreen() {
   const login = useAuthStore((s) => s.login);
+
+  // Which org is selected — null means no org picked yet
+  const [selectedOrg, setSelectedOrg] = useState<typeof ORGANIZATIONS[0] | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  // ── Auth Request (PKCE) ─────────────────────────────────────────────
+  // Discovery document computed from selected org's tenant
+  const discovery: AuthSession.DiscoveryDocument | null = selectedOrg
+    ? {
+        authorizationEndpoint: `https://login.microsoftonline.com/${selectedOrg.tenantId}/oauth2/v2.0/authorize`,
+        tokenEndpoint: `https://login.microsoftonline.com/${selectedOrg.tenantId}/oauth2/v2.0/token`,
+      }
+    : null;
+
   const [request, response, promptAsync] = AuthSession.useAuthRequest(
-    {
-      clientId: CLIENT_ID,
-      scopes: SCOPES,
-      redirectUri,
-      responseType: AuthSession.ResponseType.Code,
-      usePKCE: true,
-      prompt: AuthSession.Prompt.SelectAccount as any,
-      extraParams: {
-        prompt: "select_account",
-      },
-    },
+    selectedOrg
+      ? {
+          clientId: selectedOrg.clientId,
+          scopes: SCOPES,
+          redirectUri,
+          responseType: AuthSession.ResponseType.Code,
+          usePKCE: true,
+          prompt: AuthSession.Prompt.SelectAccount as any,
+          extraParams: { prompt: "select_account" },
+        }
+      : { clientId: "", scopes: [], redirectUri },
     discovery,
   );
 
-  // ── Handle the response from the Microsoft login page ───────────────
+  // ── Handle Microsoft response ─────────────────────────────────────────
   useEffect(() => {
     if (response?.type === "success") {
       const { code } = response.params;
@@ -62,22 +78,24 @@ export default function LoginScreen() {
         "Authentication Error",
         response.error?.message || "Failed to log in with Microsoft.",
       );
+      setSelectedOrg(null);
     }
   }, [response]);
 
-  // ── Exchange auth code → access token → fetch profile ───────────────
+  // ── Exchange code → token → profile ──────────────────────────────────
   const exchangeCodeForToken = async (code: string) => {
+    if (!selectedOrg) return;
     try {
       setIsLoading(true);
-
+      const discovery = {
+        tokenEndpoint: `https://login.microsoftonline.com/${selectedOrg.tenantId}/oauth2/v2.0/token`,
+      };
       const tokenResponse = await AuthSession.exchangeCodeAsync(
         {
-          clientId: CLIENT_ID,
+          clientId: selectedOrg.clientId,
           code,
           redirectUri,
-          extraParams: {
-            code_verifier: request?.codeVerifier || "",
-          },
+          extraParams: { code_verifier: request?.codeVerifier || "" },
         },
         discovery,
       );
@@ -91,52 +109,47 @@ export default function LoginScreen() {
           name: userInfo.displayName || userInfo.givenName || "User",
           email: userInfo.mail || userInfo.userPrincipalName || "",
           microsoftId: userInfo.id,
+          organization: selectedOrg.name,
         },
         accessToken,
       );
     } catch (error: any) {
       console.error("Token exchange error:", error);
-      Alert.alert(
-        "Login Failed",
-        error?.message || "Could not complete the sign-in. Please try again.",
-      );
+      Alert.alert("Login Failed", error?.message || "Could not complete sign-in. Please try again.");
+      setSelectedOrg(null);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // ── Microsoft Graph: GET /me ────────────────────────────────────────
   const fetchMicrosoftProfile = async (accessToken: string) => {
     const res = await fetch("https://graph.microsoft.com/v1.0/me", {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (!res.ok) {
-      throw new Error(`Microsoft Graph /me failed with status ${res.status}`);
-    }
+    if (!res.ok) throw new Error(`Microsoft Graph /me failed: ${res.status}`);
     return res.json();
   };
 
-  // ── Microsoft SSO button press ──────────────────────────────────────
-  const onMicrosoftLogin = async () => {
-    if (!CLIENT_ID) {
-      Alert.alert(
-        "Configuration Missing",
-        "Microsoft Client ID is not set. Please add EXPO_PUBLIC_AZURE_CLIENT_ID to your .env file.",
-      );
+  // ── When org is selected, launch Microsoft login ──────────────────────
+  const onOrgSelect = async (org: typeof ORGANIZATIONS[0]) => {
+    if (!org.clientId) {
+      Alert.alert("Configuration Missing", `Client ID for ${org.name} is not configured.`);
       return;
     }
-    setIsLoading(true);
-    try {
-      await promptAsync();
-    } catch (error) {
-      console.error("Microsoft login error:", error);
-      Alert.alert("Error", "Failed to start Microsoft Login.");
-    } finally {
-      setIsLoading(false);
-    }
+    setSelectedOrg(org);
   };
 
-  // ── UI ──────────────────────────────────────────────────────────────
+  // Trigger promptAsync after selectedOrg + request is ready
+  useEffect(() => {
+    if (selectedOrg && request) {
+      promptAsync().catch((e) => {
+        console.error("promptAsync error:", e);
+        setSelectedOrg(null);
+      });
+    }
+  }, [request]);
+
+  // ── UI ────────────────────────────────────────────────────────────────
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -145,32 +158,43 @@ export default function LoginScreen() {
         <Text style={styles.subtitle}>Medical Clinical Documentation</Text>
       </View>
 
-      <View style={styles.actions}>
-        <TouchableOpacity
-          style={[styles.button, styles.primaryButton]}
-          onPress={onMicrosoftLogin}
-          disabled={!request || isLoading}
-        >
-          {isLoading ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <>
-              <Ionicons name="logo-microsoft" size={20} color="#fff" style={styles.buttonIcon} />
-              <Text style={styles.primaryButtonText}>Sign in with Microsoft</Text>
-            </>
-          )}
-        </TouchableOpacity>
+      <Text style={styles.sectionLabel}>Select your organization</Text>
+
+      <View style={styles.orgsContainer}>
+        {ORGANIZATIONS.map((org) => (
+          <TouchableOpacity
+            key={org.id}
+            style={[
+              styles.orgButton,
+              selectedOrg?.id === org.id && styles.orgButtonActive,
+            ]}
+            onPress={() => onOrgSelect(org)}
+            disabled={isLoading}
+          >
+            {isLoading && selectedOrg?.id === org.id ? (
+              <ActivityIndicator color={colors.brand} />
+            ) : (
+              <View style={styles.orgRow}>
+                <View style={styles.orgIconWrap}>
+                  <Ionicons name="business" size={20} color={colors.brand} />
+                </View>
+                <View style={styles.orgInfo}>
+                  <Text style={styles.orgName}>{org.name}</Text>
+                  <Text style={styles.orgHint}>Sign in with Microsoft</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
+              </View>
+            )}
+          </TouchableOpacity>
+        ))}
       </View>
 
       <Text style={styles.footerText}>
         Sign in with your organization's Microsoft account to get started.
       </Text>
 
-      {/* Debug info — remove in production */}
       {__DEV__ && (
-        <Text style={styles.debugText}>
-          Redirect URI: {redirectUri}
-        </Text>
+        <Text style={styles.debugText}>Redirect URI: {redirectUri}</Text>
       )}
     </View>
   );
@@ -198,26 +222,53 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     marginTop: spacing.xs,
   },
-  actions: {
+  sectionLabel: {
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.textSecondary,
+    marginBottom: spacing.sm,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  orgsContainer: {
     gap: spacing.md,
   },
-  button: {
+  orgButton: {
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 14,
+    padding: spacing.md,
+  },
+  orgButtonActive: {
+    borderColor: colors.brand,
+    backgroundColor: colors.brandLight || "#E6F9F1",
+  },
+  orgRow: {
     flexDirection: "row",
     alignItems: "center",
+    gap: spacing.md,
+  },
+  orgIconWrap: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: colors.brandLight || "#E6F9F1",
+    alignItems: "center",
     justifyContent: "center",
-    padding: spacing.md,
-    borderRadius: 12,
   },
-  primaryButton: {
-    backgroundColor: colors.brand,
+  orgInfo: {
+    flex: 1,
   },
-  primaryButtonText: {
-    color: "#fff",
+  orgName: {
     fontSize: fontSize.md,
-    fontWeight: "600",
+    fontWeight: "700",
+    color: colors.text,
   },
-  buttonIcon: {
-    marginRight: spacing.sm,
+  orgHint: {
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+    marginTop: 2,
   },
   footerText: {
     textAlign: "center",

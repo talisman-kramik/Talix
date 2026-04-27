@@ -3,7 +3,7 @@
  * Typed SDK matching the web app's lib/api.ts interface.
  */
 
-import { getApiUrl } from "../store/settings";
+import { getApiUrl, getApiKey } from "../store/settings";
 
 // ---------------------------------------------------------------------------
 // Types (mirroring web app)
@@ -100,6 +100,16 @@ const COMMON_HEADERS: Record<string, string> = {
   "Bypass-Tunnel-Reminder": "true",
 };
 
+/**
+ * Build auth headers for AI Scribe backend calls.
+ * Injects `Authorization: Bearer <key>` when AI_SCRIBE_API_KEY is set.
+ * Returns an empty object if no key is configured (dev / local environments).
+ */
+function getAuthHeaders(): Record<string, string> {
+  const key = getApiKey();
+  return key ? { Authorization: `Bearer ${key}` } : {};
+}
+
 async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
   const base = getApiUrl();
   let fullUrl = `${base}${path}`;
@@ -109,7 +119,7 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
       .join("&");
     fullUrl += `?${qs}`;
   }
-  const res = await fetch(fullUrl, { headers: COMMON_HEADERS });
+  const res = await fetch(fullUrl, { headers: { ...COMMON_HEADERS, ...getAuthHeaders() } });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`API ${res.status}: ${path} — ${body}`);
@@ -121,7 +131,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   const base = getApiUrl();
   const res = await fetch(`${base}${path}`, {
     method: "POST",
-    headers: { ...COMMON_HEADERS, "Content-Type": "application/json" },
+    headers: { ...COMMON_HEADERS, ...getAuthHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -309,7 +319,7 @@ export async function uploadEncounterAudio(
   const res = await fetch(`${base}/encounters/${encounterId}/upload`, {
     method: "POST",
     body: form,
-    headers: headersWithoutCT,
+    headers: { ...headersWithoutCT, ...getAuthHeaders() },
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: `Upload failed (${res.status})` }));

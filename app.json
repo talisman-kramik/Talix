@@ -2,7 +2,7 @@
   "expo": {
     "name": "Talix",
     "slug": "talix",
-    "scheme": ["talix", "msauth.com.talismansolutions.talix"],
+    "scheme": ["talix", "msauth.com.talismansolutions.talix", "msauth.com.talismansolutions.talixapp"],
     "version": "1.0.0",
     "orientation": "default",
     "icon": "./assets/icon.png",
@@ -14,7 +14,7 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.talismansolutions.talix",
+      "bundleIdentifier": "com.talismansolutions.talixapp",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "Talix needs microphone access to record medical encounters for transcription.",
@@ -36,7 +36,7 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "package": "com.talismansolutions.talix",
+      "package": "com.talismansolutions.talixapp",
       "permissions": ["RECORD_AUDIO"]
     },
     "web": {

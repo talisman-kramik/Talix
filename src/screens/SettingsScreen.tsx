@@ -26,6 +26,7 @@ import { useAuthStore } from "../store/auth";
 // Microsoft Entra ID logout URL
 const TENANT_ID = process.env.EXPO_PUBLIC_AZURE_TENANT_ID || "common";
 const MS_LOGOUT_URL = `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/logout`;
+const APP_SCHEME = "msauth.com.talismansolutions.talixapp";
 
 export default function SettingsScreen() {
   const { width } = useWindowDimensions();
