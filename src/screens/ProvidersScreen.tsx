@@ -10,6 +10,7 @@ import {
   TouchableOpacity,
   RefreshControl,
   useWindowDimensions,
+  TextInput,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -26,6 +27,8 @@ export default function ProvidersScreen() {
 
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [search, setSearch] = useState("");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const ps = await fetchProviders();
@@ -42,7 +45,17 @@ export default function ProvidersScreen() {
     setRefreshing(false);
   };
 
+  const filteredProviders = providers.filter((p) => {
+    if (!search) return true;
+    const q = search.toLowerCase();
+    return (
+      (p.name && p.name.toLowerCase().includes(q)) ||
+      p.id.toLowerCase().includes(q)
+    );
+  });
+
   const renderItem = ({ item }: { item: ProviderSummary }) => {
+    const isExpanded = expandedId === item.id;
     const score = item.latest_score;
     const scoreVariant = () => {
       if (score == null) return "neutral" as const;
@@ -52,7 +65,11 @@ export default function ProvidersScreen() {
     };
 
     return (
-      <View style={[styles.card, isTablet && styles.tabletCard]}>
+      <TouchableOpacity
+        style={[styles.card, isTablet && styles.tabletCard]}
+        activeOpacity={0.7}
+        onPress={() => setExpandedId(isExpanded ? null : item.id)}
+      >
         <View style={styles.cardTop}>
           <View style={styles.avatar}>
             <Ionicons name="person" size={22} color={colors.brand} />
@@ -63,17 +80,34 @@ export default function ProvidersScreen() {
               <Text style={styles.credentials}>{item.credentials}</Text>
             )}
           </View>
+          <Ionicons
+            name={isExpanded ? "chevron-up" : "chevron-down"}
+            size={20}
+            color={colors.textTertiary}
+          />
         </View>
 
+        {isExpanded && (
+          <View style={styles.expandedDetails}>
+            <Text style={styles.detailText}><Text style={styles.detailLabel}>Provider ID:</Text> {item.id}</Text>
+            {item.specialty && (
+              <Text style={styles.detailText}><Text style={styles.detailLabel}>Specialty:</Text> {item.specialty}</Text>
+            )}
+            {score != null && (
+              <Text style={styles.detailText}><Text style={styles.detailLabel}>Overall Quality Score:</Text> {score.toFixed(2)}</Text>
+            )}
+          </View>
+        )}
+
         <View style={styles.cardMeta}>
-          {item.specialty && <Badge label={item.specialty} variant="info" />}
-          {score != null && (
+          {item.specialty && !isExpanded && <Badge label={item.specialty} variant="info" />}
+          {score != null && !isExpanded && (
             <Badge label={`Quality: ${score.toFixed(2)}`} variant={scoreVariant()} />
           )}
         </View>
 
         {/* Version scores */}
-        {Object.keys(item.quality_scores).length > 0 && (
+        {Object.keys(item.quality_scores).length > 0 && isExpanded && (
           <View style={styles.scoresRow}>
             {Object.entries(item.quality_scores)
               .sort(([a], [b]) => a.localeCompare(b))
@@ -86,32 +120,72 @@ export default function ProvidersScreen() {
               ))}
           </View>
         )}
-      </View>
+      </TouchableOpacity>
     );
   };
 
   return (
-    <FlatList
-      style={styles.container}
-      data={providers}
-      keyExtractor={(p) => p.id}
-      renderItem={renderItem}
-      numColumns={numColumns}
-      key={numColumns}
-      contentContainerStyle={[styles.listContent, isTablet && styles.tabletListContent]}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.brand} />}
-      ListEmptyComponent={
-        <View style={styles.empty}>
-          <Ionicons name="people-outline" size={40} color={colors.textTertiary} />
-          <Text style={styles.emptyText}>No providers configured</Text>
+    <View style={styles.container}>
+      <View style={styles.topSection}>
+        <View style={styles.searchBox}>
+          <Ionicons name="search" size={16} color={colors.textTertiary} />
+          <TextInput
+            value={search}
+            onChangeText={setSearch}
+            placeholder="Search providers by name or ID..."
+            style={styles.searchInput}
+            placeholderTextColor={colors.textTertiary}
+          />
+          {search.length > 0 && (
+            <TouchableOpacity onPress={() => setSearch("")}>
+              <Ionicons name="close-circle" size={16} color={colors.textTertiary} />
+            </TouchableOpacity>
+          )}
         </View>
-      }
-    />
+      </View>
+
+      <FlatList
+        data={filteredProviders}
+        keyExtractor={(p) => p.id}
+        renderItem={renderItem}
+        numColumns={numColumns}
+        key={numColumns}
+        contentContainerStyle={[styles.listContent, isTablet && styles.tabletListContent]}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.brand} />}
+        ListEmptyComponent={
+          <View style={styles.empty}>
+            <Ionicons name="people-outline" size={40} color={colors.textTertiary} />
+            <Text style={styles.emptyText}>No providers found</Text>
+          </View>
+        }
+      />
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
+  topSection: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.sm,
+  },
+  searchBox: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    height: 44,
+  },
+  searchInput: {
+    flex: 1,
+    marginLeft: spacing.sm,
+    fontSize: fontSize.sm,
+    color: colors.text,
+  },
   listContent: { padding: spacing.lg, gap: spacing.md },
   tabletListContent: { maxWidth: 900, alignSelf: "center", width: "100%" },
   card: {
@@ -134,6 +208,21 @@ const styles = StyleSheet.create({
   },
   name: { fontSize: fontSize.md, fontWeight: "600", color: colors.text },
   credentials: { fontSize: fontSize.xs, color: colors.textSecondary },
+  expandedDetails: {
+    marginTop: spacing.md,
+    paddingTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.borderLight,
+    gap: 4,
+  },
+  detailText: {
+    fontSize: fontSize.sm,
+    color: colors.text,
+  },
+  detailLabel: {
+    fontWeight: "600",
+    color: colors.textSecondary,
+  },
   cardMeta: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md },
   scoresRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md, flexWrap: "wrap" },
   scorePill: {

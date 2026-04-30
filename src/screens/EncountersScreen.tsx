@@ -13,6 +13,7 @@ import {
   useWindowDimensions,
   TextInput,
   ScrollView,
+  ActivityIndicator,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useNavigation } from "@react-navigation/native";
@@ -35,11 +36,19 @@ export default function EncountersScreen() {
   const [filterMode, setFilterMode] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
 
   const loadData = useCallback(async () => {
-    const [s, p] = await Promise.all([fetchSamples(), fetchProviders()]);
-    setSamples(s);
-    setProviders(p);
+    setIsLoading(true);
+    try {
+      const [s, p] = await Promise.all([fetchSamples(), fetchProviders()]);
+      setSamples(s);
+      setProviders(p);
+    } catch (err) {
+      console.warn("Failed to load encounters data", err);
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -52,8 +61,15 @@ export default function EncountersScreen() {
     setRefreshing(false);
   };
 
+  const selectedProviderObj = providers.find(p => p.id === filterProvider);
+
   const filtered = samples.filter((s) => {
-    if (filterProvider && s.physician !== filterProvider) return false;
+    if (selectedProviderObj) {
+      const pName = selectedProviderObj.name;
+      const matchName = pName && s.physician === pName;
+      const matchId = s.physician === selectedProviderObj.id;
+      if (!matchName && !matchId) return false;
+    }
     if (filterMode && s.mode !== filterMode) return false;
     if (search && !s.sample_id.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
@@ -207,11 +223,18 @@ export default function EncountersScreen() {
         contentContainerStyle={[styles.listContent, isTablet && styles.tabletListContent]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.brand} />}
         ListEmptyComponent={
-          <View style={styles.empty}>
-            <Ionicons name="document-text-outline" size={48} color={colors.textTertiary} />
-            <Text style={styles.emptyTitle}>No encounters found</Text>
-            <Text style={styles.emptySubtitle}>Try clearing your filters or pull to refresh</Text>
-          </View>
+          isLoading ? (
+            <View style={styles.empty}>
+              <ActivityIndicator size="large" color={colors.brand} />
+              <Text style={styles.emptyTitle}>Loading encounters...</Text>
+            </View>
+          ) : (
+            <View style={styles.empty}>
+              <Ionicons name="document-text-outline" size={48} color={colors.textTertiary} />
+              <Text style={styles.emptyTitle}>No encounters found</Text>
+              <Text style={styles.emptySubtitle}>Try clearing your filters or pull to refresh</Text>
+            </View>
+          )
         }
       />
     </View>

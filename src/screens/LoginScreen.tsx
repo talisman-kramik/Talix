@@ -130,6 +130,17 @@ export default function LoginScreen() {
     return res.json();
   };
 
+  // ── Demo login for App Review (Apple reviewer access) ────────────────
+  const onDemoLogin = async () => {
+    await login({
+      method: "entra",
+      name: "Demo Reviewer",
+      email: "demo@talismansolutions.com",
+      microsoftId: "demo-reviewer",
+      organization: "Talisman Solutions",
+    });
+  };
+
   // ── When org is selected, launch Microsoft login ──────────────────────
   const onOrgSelect = async (org: typeof ORGANIZATIONS[0]) => {
     if (!org.clientId) {
@@ -193,6 +204,10 @@ export default function LoginScreen() {
         Sign in with your organization's Microsoft account to get started.
       </Text>
 
+      <TouchableOpacity onPress={onDemoLogin} style={styles.demoBtn} disabled={isLoading}>
+        <Text style={styles.demoBtnText}>App Review / Demo Access</Text>
+      </TouchableOpacity>
+
       {__DEV__ && (
         <Text style={styles.debugText}>Redirect URI: {redirectUri}</Text>
       )}
@@ -242,7 +257,7 @@ const styles = StyleSheet.create({
   },
   orgButtonActive: {
     borderColor: colors.brand,
-    backgroundColor: colors.brandLight || "#E6F9F1",
+    backgroundColor: "#E6F9F1",
   },
   orgRow: {
     flexDirection: "row",
@@ -253,7 +268,7 @@ const styles = StyleSheet.create({
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: colors.brandLight || "#E6F9F1",
+    backgroundColor: "#E6F9F1",
     alignItems: "center",
     justifyContent: "center",
   },
@@ -276,6 +291,16 @@ const styles = StyleSheet.create({
     fontSize: fontSize.sm,
     marginTop: spacing.xl,
     lineHeight: 20,
+  },
+  demoBtn: {
+    marginTop: spacing.xl,
+    alignItems: "center",
+    paddingVertical: spacing.sm,
+  },
+  demoBtnText: {
+    fontSize: fontSize.xs,
+    color: colors.textTertiary,
+    textDecorationLine: "underline",
   },
   debugText: {
     textAlign: "center",

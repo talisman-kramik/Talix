@@ -57,6 +57,7 @@ export default function RecordScreen() {
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [patients, setPatients] = useState<PatientSearchResult[]>([]);
   const [patientQuery, setPatientQuery] = useState("");
+  const [providerQuery, setProviderQuery] = useState("");
 
   // Selections
   const [providerId, setProviderId] = useState("");
@@ -83,7 +84,7 @@ export default function RecordScreen() {
   // Re-fetch when the API URL changes (e.g. user saves cloudflare tunnel URL)
   const apiUrl = useSettings((s) => s.apiUrl);
 
-  // Load data
+  // Load providers
   useEffect(() => {
     fetchProviders()
       .then((ps) => {
@@ -91,32 +92,47 @@ export default function RecordScreen() {
         if (ps.length > 0 && !providerId) setProviderId(ps[0].id);
       })
       .catch(() => {});
-    searchPatients("").then(setPatients).catch(() => {});
   }, [apiUrl]);
 
-  // Patient search — auto-select when query exactly matches MRN or patient id (no tap required)
+  // Patient search — fetch once per provider, filter locally
+  const [allPatients, setAllPatients] = useState<PatientSearchResult[]>([]);
+
   useEffect(() => {
-    if (patientQuery.length === 0) {
-      searchPatients("").then(setPatients).catch(() => {});
+    // Only hit the network when providerId changes (or on mount if we want all)
+    searchPatients("", providerId)
+      .then((list) => {
+        setAllPatients(list);
+        setPatients(list);
+      })
+      .catch(() => {});
+  }, [providerId, apiUrl]);
+
+  // Local filtering when user types
+  useEffect(() => {
+    const q = patientQuery.trim().toLowerCase();
+    if (!q) {
+      setPatients(allPatients);
       return;
     }
-    const timer = setTimeout(() => {
-      const q = patientQuery.trim();
-      searchPatients(patientQuery)
-        .then((list) => {
-          setPatients(list);
-          const exact =
-            list.find((p) => p.mrn === q) ||
-            list.find((p) => p.id.toLowerCase() === q.toLowerCase());
-          if (exact) {
-            setSelectedPatient(exact);
-            setPatientQuery("");
-          }
-        })
-        .catch(() => {});
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [patientQuery]);
+    
+    const filtered = allPatients.filter(p => 
+      p.first_name.toLowerCase().includes(q) ||
+      p.last_name.toLowerCase().includes(q) ||
+      p.mrn.toLowerCase().includes(q) ||
+      p.id.toLowerCase().includes(q)
+    );
+    
+    setPatients(filtered);
+
+    // Auto-select exact match
+    const exact =
+      allPatients.find((p) => p.mrn.toLowerCase() === q) ||
+      allPatients.find((p) => p.id.toLowerCase() === q);
+    if (exact) {
+      setSelectedPatient(exact);
+      setPatientQuery("");
+    }
+  }, [patientQuery, allPatients]);
 
   // Cleanup
   useEffect(() => {
@@ -125,6 +141,22 @@ export default function RecordScreen() {
       wsRef.current?.close();
     };
   }, []);
+
+  // Auto-select Visit Type based on patient's appointment class
+  useEffect(() => {
+    if (selectedPatient?.appointment_class) {
+      const cls = selectedPatient.appointment_class.toLowerCase();
+      if (cls.includes("initial") || cls.includes("eval") || cls.includes("new")) {
+        setVisitType("initial_evaluation");
+      } else if (cls.includes("assume") || cls.includes("transfer")) {
+        setVisitType("assume_care");
+      } else if (cls.includes("discharge")) {
+        setVisitType("discharge");
+      } else {
+        setVisitType("follow_up");
+      }
+    }
+  }, [selectedPatient]);
 
   // ---- Recording ----
   const startRecording = async () => {
@@ -267,7 +299,10 @@ export default function RecordScreen() {
   };
 
   // ---- Render ----
-  const showPatientList = patientQuery.length >= 0 && !selectedPatient;
+  const filteredProviders = providers.filter(p => 
+    p.name?.toLowerCase().includes(providerQuery.toLowerCase()) || 
+    p.id.includes(providerQuery)
+  );
 
   return (
     <ScrollView
@@ -294,22 +329,41 @@ export default function RecordScreen() {
         {providers.length === 0 ? (
           <Text style={styles.sublabel}>Loading providers...</Text>
         ) : (
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: spacing.sm }}>
-            {providers.map((p) => (
-              <TouchableOpacity
-                key={p.id}
-                onPress={() => setProviderId(p.id)}
-                style={[
-                  styles.chip,
-                  providerId === p.id && styles.chipActive,
-                ]}
-              >
-                <Text style={[styles.chipText, providerId === p.id && styles.chipTextActive]}>
-                  {p.name ?? p.id}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
+          <>
+            <View style={styles.searchBox}>
+              <Ionicons name="search" size={16} color={colors.textTertiary} />
+              <TextInput
+                value={providerQuery}
+                onChangeText={setProviderQuery}
+                placeholder="Search providers..."
+                style={styles.searchInput}
+                placeholderTextColor={colors.textTertiary}
+              />
+            </View>
+            <FlatList
+              data={filteredProviders}
+              keyExtractor={(p) => p.id}
+              scrollEnabled={true}
+              nestedScrollEnabled={true}
+              style={{ maxHeight: 200, marginTop: spacing.sm }}
+              renderItem={({ item }) => {
+                const isActive = providerId === item.id;
+                return (
+                  <TouchableOpacity
+                    style={[styles.listRow, isActive && styles.listRowActive]}
+                    onPress={() => setProviderId(item.id)}
+                  >
+                    <Text style={[styles.listRowName, isActive && styles.listRowNameActive]}>
+                      {item.name ?? item.id}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              }}
+              ListEmptyComponent={
+                <Text style={styles.sublabel}>No providers found.</Text>
+              }
+            />
+          </>
         )}
       </Card>
 
@@ -326,7 +380,7 @@ export default function RecordScreen() {
                 MRN: {selectedPatient.mrn} · DOB: {selectedPatient.date_of_birth}
               </Text>
             </View>
-            <TouchableOpacity onPress={() => { setSelectedPatient(null); setPatientQuery(""); }}>
+            <TouchableOpacity onPress={() => setSelectedPatient(null)}>
               <Ionicons name="close-circle" size={22} color={colors.textTertiary} />
             </TouchableOpacity>
           </View>
@@ -340,15 +394,17 @@ export default function RecordScreen() {
               <TextInput
                 value={patientQuery}
                 onChangeText={setPatientQuery}
-                placeholder="Search by name or MRN..."
+                placeholder="Search patients by name or MRN..."
                 style={styles.searchInput}
                 placeholderTextColor={colors.textTertiary}
               />
             </View>
             <FlatList
-              data={patients.slice(0, 6)}
+              data={patients}
               keyExtractor={(p) => p.id}
-              scrollEnabled={false}
+              scrollEnabled={true}
+              nestedScrollEnabled={true}
+              style={{ maxHeight: 250, marginTop: spacing.sm }}
               renderItem={({ item }) => (
                 <TouchableOpacity style={styles.patientRow} onPress={() => setSelectedPatient(item)}>
                   <Text style={styles.patientName}>
@@ -359,6 +415,9 @@ export default function RecordScreen() {
                   </Text>
                 </TouchableOpacity>
               )}
+              ListEmptyComponent={
+                <Text style={styles.sublabel}>No patients found. Try adjusting your search.</Text>
+              }
             />
           </>
         )}
@@ -548,7 +607,11 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   searchInput: { flex: 1, paddingVertical: spacing.sm, marginLeft: spacing.sm, fontSize: fontSize.sm, color: colors.text },
-  patientRow: { paddingVertical: spacing.sm, borderBottomWidth: 1, borderBottomColor: colors.borderLight },
+  listRow: { paddingVertical: spacing.sm, paddingHorizontal: spacing.sm, borderRadius: radius.sm },
+  listRowActive: { backgroundColor: "#D1FAE5" },
+  listRowName: { fontSize: fontSize.sm, color: colors.text },
+  listRowNameActive: { color: colors.brand, fontWeight: "600" },
+  patientRow: { paddingVertical: spacing.sm, paddingHorizontal: spacing.sm, borderBottomWidth: 1, borderBottomColor: colors.borderLight },
   patientName: { fontSize: fontSize.sm, fontWeight: "600", color: colors.text },
   patientMeta: { fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 },
   selectedPatient: {

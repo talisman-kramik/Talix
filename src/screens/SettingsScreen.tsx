@@ -19,7 +19,7 @@ import * as WebBrowser from "expo-web-browser";
 import Card from "../components/Card";
 import Badge from "../components/Badge";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
-import { useSettings, DEFAULT_API_URL } from "../store/settings";
+import { useSettings, DEFAULT_API_URL, getApiKey } from "../store/settings";
 import { useOfflineStore } from "../store/offline";
 import { useAuthStore } from "../store/auth";
 
@@ -62,7 +62,10 @@ export default function SettingsScreen() {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(`${trimmed}/providers`, { signal: controller.signal });
+      const key = getApiKey();
+      const headers: Record<string, string> = { "Bypass-Tunnel-Reminder": "true" };
+      if (key) headers["Authorization"] = `Bearer ${key}`;
+      const res = await fetch(`${trimmed}/providers`, { signal: controller.signal, headers });
       clearTimeout(timeout);
       if (res.ok) {
         setTestResult({ ok: true, msg: "Connected to provider-facing server" });
@@ -367,7 +370,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 4,
     marginTop: spacing.xs,
-    backgroundColor: colors.brandLight || "#E6F9F1",
+    backgroundColor: "#E6F9F1",
     paddingHorizontal: spacing.sm,
     paddingVertical: 3,
     borderRadius: 12,

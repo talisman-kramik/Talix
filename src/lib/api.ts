@@ -72,6 +72,7 @@ export interface PatientSearchResult {
   sex: string;
   mrn: string;
   practice_id: string;
+  appointment_class?: string;
 }
 
 export interface EncounterCreateResponse {
@@ -245,15 +246,26 @@ export const fetchProvider = (id: string) =>
 // Patients
 // ---------------------------------------------------------------------------
 
-export const searchPatients = async (q: string): Promise<PatientSearchResult[]> => {
+export const searchPatients = async (q: string, providerId?: string): Promise<PatientSearchResult[]> => {
   const eclipse = getEclipseConfig();
   if (eclipse.url && eclipse.uuid && eclipse.token) {
     try {
       const endpoint = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
       const params = new URLSearchParams();
-      params.append("filters[0][name]", "source_system");
-      params.append("filters[0][operator]", "==");
-      params.append("filters[0][values][0]", "Eclipse");
+      
+      let filterIndex = 0;
+      params.append(`filters[${filterIndex}][name]`, "source_system");
+      params.append(`filters[${filterIndex}][operator]`, "==");
+      params.append(`filters[${filterIndex}][values][0]`, "Eclipse");
+      filterIndex++;
+
+      if (providerId) {
+        params.append(`filters[${filterIndex}][name]`, "appointment_provider_id");
+        params.append(`filters[${filterIndex}][operator]`, "==");
+        params.append(`filters[${filterIndex}][values][0]`, providerId);
+        filterIndex++;
+      }
+
       params.append("perPage", "500");
 
       const res = await fetch(`${endpoint}?${params.toString()}`, {
@@ -271,6 +283,7 @@ export const searchPatients = async (q: string): Promise<PatientSearchResult[]> 
           sex: row.sex || "Unknown",
           mrn: row.patient_case_id || "Unknown",
           practice_id: "Eclipse",
+          appointment_class: row.case_class || row.appointment_status || undefined,
         }));
 
         if (q) {
@@ -287,7 +300,10 @@ export const searchPatients = async (q: string): Promise<PatientSearchResult[]> 
       console.warn("Eclipse search patients failed, falling back.", err);
     }
   }
-  return get<PatientSearchResult[]>("/patients/search", { q }).then(dedupeById);
+  
+  // For the regular backend, it might not support providerId in /patients/search natively in the same way,
+  // but we can pass it if it does. The original didn't, so we'll just pass q.
+  return get<PatientSearchResult[]>("/patients/search", { q, ...(providerId ? { provider_id: providerId } : {}) }).then(dedupeById);
 };
 
 // ---------------------------------------------------------------------------
