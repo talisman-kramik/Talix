@@ -11,6 +11,7 @@ import {
   RefreshControl,
   useWindowDimensions,
   TextInput,
+  ActivityIndicator,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -29,10 +30,21 @@ export default function ProvidersScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [search, setSearch] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
 
   const load = useCallback(async () => {
-    const ps = await fetchProviders();
-    setProviders(ps);
+    setIsLoading(true);
+    setLoadError(null);
+    try {
+      const ps = await fetchProviders();
+      setProviders(ps);
+    } catch (err) {
+      setProviders([]);
+      setLoadError(err instanceof Error ? err.message : "Failed to load providers");
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -66,7 +78,7 @@ export default function ProvidersScreen() {
 
     return (
       <TouchableOpacity
-        style={[styles.card, isTablet && styles.tabletCard]}
+        style={[styles.card, isTablet && styles.tabletCard, isExpanded && styles.cardExpanded]}
         activeOpacity={0.7}
         onPress={() => setExpandedId(isExpanded ? null : item.id)}
       >
@@ -79,6 +91,9 @@ export default function ProvidersScreen() {
             {item.credentials && (
               <Text style={styles.credentials}>{item.credentials}</Text>
             )}
+            {!item.credentials && (
+              <Text style={styles.credentials}>Tap to view provider details</Text>
+            )}
           </View>
           <Ionicons
             name={isExpanded ? "chevron-up" : "chevron-down"}
@@ -90,12 +105,20 @@ export default function ProvidersScreen() {
         {isExpanded && (
           <View style={styles.expandedDetails}>
             <Text style={styles.detailText}><Text style={styles.detailLabel}>Provider ID:</Text> {item.id}</Text>
-            {item.specialty && (
-              <Text style={styles.detailText}><Text style={styles.detailLabel}>Specialty:</Text> {item.specialty}</Text>
-            )}
-            {score != null && (
-              <Text style={styles.detailText}><Text style={styles.detailLabel}>Overall Quality Score:</Text> {score.toFixed(2)}</Text>
-            )}
+            <Text style={styles.detailText}>
+              <Text style={styles.detailLabel}>Credentials:</Text> {item.credentials || "Not available"}
+            </Text>
+            <Text style={styles.detailText}>
+              <Text style={styles.detailLabel}>Specialty:</Text> {item.specialty || "Not available"}
+            </Text>
+            <Text style={styles.detailText}>
+              <Text style={styles.detailLabel}>Overall Quality Score:</Text>{" "}
+              {score != null ? score.toFixed(2) : "Not available"}
+            </Text>
+            <Text style={styles.detailText}>
+              <Text style={styles.detailLabel}>Tracked Versions:</Text>{" "}
+              {Object.keys(item.quality_scores).length}
+            </Text>
           </View>
         )}
 
@@ -154,8 +177,17 @@ export default function ProvidersScreen() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.brand} />}
         ListEmptyComponent={
           <View style={styles.empty}>
-            <Ionicons name="people-outline" size={40} color={colors.textTertiary} />
-            <Text style={styles.emptyText}>No providers found</Text>
+            {isLoading ? (
+              <>
+                <ActivityIndicator size="small" color={colors.brand} />
+                <Text style={styles.emptyText}>Loading providers...</Text>
+              </>
+            ) : (
+              <>
+                <Ionicons name="people-outline" size={40} color={colors.textTertiary} />
+                <Text style={styles.emptyText}>{loadError ? `Unable to load providers: ${loadError}` : "No providers found"}</Text>
+              </>
+            )}
           </View>
         }
       />
@@ -195,6 +227,10 @@ const styles = StyleSheet.create({
     padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
+  },
+  cardExpanded: {
+    borderColor: colors.brand,
+    backgroundColor: "#F0FDF4",
   },
   tabletCard: { marginHorizontal: spacing.xs },
   cardTop: { flexDirection: "row", alignItems: "center" },

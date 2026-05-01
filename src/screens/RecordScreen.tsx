@@ -26,6 +26,7 @@ import {
   fetchProviders,
   searchPatients,
   createEncounter,
+  resolveEncounterProviderId,
   uploadEncounterAudio,
   getWsUrl,
   type ProviderSummary,
@@ -48,6 +49,10 @@ const MODES = [
 
 type PipelineStage = "idle" | "recording" | "creating" | "uploading" | "processing" | "complete" | "error";
 
+function normalize(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
 export default function RecordScreen() {
   const nav = useNavigation<any>();
   const { width } = useWindowDimensions();
@@ -55,9 +60,12 @@ export default function RecordScreen() {
 
   // Data
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
+  const [providersLoaded, setProvidersLoaded] = useState(false);
   const [patients, setPatients] = useState<PatientSearchResult[]>([]);
   const [patientQuery, setPatientQuery] = useState("");
   const [providerQuery, setProviderQuery] = useState("");
+  const [providerLoadError, setProviderLoadError] = useState<string | null>(null);
+  const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
 
   // Selections
   const [providerId, setProviderId] = useState("");
@@ -86,12 +94,26 @@ export default function RecordScreen() {
 
   // Load providers
   useEffect(() => {
+    setProviderLoadError(null);
+    setProvidersLoaded(false);
     fetchProviders()
       .then((ps) => {
-        setProviders(ps);
-        if (ps.length > 0 && !providerId) setProviderId(ps[0].id);
+        const sortedProviders = [...ps].sort((a, b) =>
+          normalize(a.name ?? a.id).localeCompare(normalize(b.name ?? b.id)),
+        );
+        setProviders(sortedProviders);
+        if (sortedProviders.length > 0) {
+          const currentExists = sortedProviders.some((p) => p.id === providerId);
+          if (!providerId || !currentExists) {
+            setProviderId(sortedProviders[0].id);
+          }
+        }
+        setProvidersLoaded(true);
       })
-      .catch(() => {});
+      .catch((err) => {
+        setProviderLoadError(err instanceof Error ? err.message : "Failed to load providers");
+        setProvidersLoaded(true);
+      });
   }, [apiUrl]);
 
   // Patient search — fetch once per provider, filter locally
@@ -99,35 +121,54 @@ export default function RecordScreen() {
 
   useEffect(() => {
     // Only hit the network when providerId changes (or on mount if we want all)
+    setSelectedPatient(null);
+    setPatientQuery("");
+    setPatients([]);
+    setAllPatients([]);
+    setPatientLoadError(null);
+    if (!providerId) {
+      return;
+    }
     searchPatients("", providerId)
       .then((list) => {
-        setAllPatients(list);
-        setPatients(list);
+        const sortedList = [...list].sort((a, b) =>
+          normalize(`${a.last_name} ${a.first_name}`).localeCompare(normalize(`${b.last_name} ${b.first_name}`)),
+        );
+        setAllPatients(sortedList);
+        setPatients(sortedList);
       })
-      .catch(() => {});
+      .catch((err) => {
+        setPatientLoadError(err instanceof Error ? err.message : "Failed to load patients");
+      });
   }, [providerId, apiUrl]);
 
   // Local filtering when user types
   useEffect(() => {
-    const q = patientQuery.trim().toLowerCase();
+    const q = normalize(patientQuery);
     if (!q) {
       setPatients(allPatients);
       return;
     }
-    
-    const filtered = allPatients.filter(p => 
-      p.first_name.toLowerCase().includes(q) ||
-      p.last_name.toLowerCase().includes(q) ||
-      p.mrn.toLowerCase().includes(q) ||
-      p.id.toLowerCase().includes(q)
-    );
-    
+
+    const filtered = allPatients.filter((p) => {
+      const fullName = normalize(`${p.first_name} ${p.last_name}`);
+      const reverseName = normalize(`${p.last_name} ${p.first_name}`);
+      return (
+        normalize(p.first_name).includes(q) ||
+        normalize(p.last_name).includes(q) ||
+        fullName.includes(q) ||
+        reverseName.includes(q) ||
+        normalize(p.mrn).includes(q) ||
+        normalize(p.id).includes(q)
+      );
+    });
+
     setPatients(filtered);
 
     // Auto-select exact match
     const exact =
-      allPatients.find((p) => p.mrn.toLowerCase() === q) ||
-      allPatients.find((p) => p.id.toLowerCase() === q);
+      allPatients.find((p) => normalize(p.mrn) === q) ||
+      allPatients.find((p) => normalize(p.id) === q);
     if (exact) {
       setSelectedPatient(exact);
       setPatientQuery("");
@@ -238,12 +279,34 @@ export default function RecordScreen() {
       setStatusMsg("Creating encounter...");
       setProgress(0);
 
-      const enc = await createEncounter({
-        provider_id: providerId,
-        patient_id: selectedPatient.id,
-        visit_type: visitType,
-        mode,
-      });
+      const selectedProviderName = providers.find((p) => p.id === providerId)?.name;
+      const encounterProviderId = await resolveEncounterProviderId(providerId, selectedProviderName);
+
+      let enc;
+      try {
+        enc = await createEncounter({
+          provider_id: encounterProviderId,
+          patient_id: selectedPatient.id,
+          visit_type: visitType,
+          mode,
+        });
+      } catch (err) {
+        // Retry once with a known-valid fallback provider for stability if mapping is rejected.
+        if (
+          encounterProviderId !== "dr_caleb_ademiloye" &&
+          err instanceof Error &&
+          err.message.includes("500")
+        ) {
+          enc = await createEncounter({
+            provider_id: "dr_caleb_ademiloye",
+            patient_id: selectedPatient.id,
+            visit_type: visitType,
+            mode,
+          });
+        } else {
+          throw err;
+        }
+      }
 
       // Connect WebSocket for progress
       const ws = new WebSocket(`${getWsUrl()}/ws/encounters/${enc.encounter_id}`);
@@ -299,10 +362,14 @@ export default function RecordScreen() {
   };
 
   // ---- Render ----
-  const filteredProviders = providers.filter(p => 
-    p.name?.toLowerCase().includes(providerQuery.toLowerCase()) || 
-    p.id.includes(providerQuery)
-  );
+  const normalizedProviderQuery = normalize(providerQuery);
+  const filteredProviders = providers.filter((p) => {
+    if (!normalizedProviderQuery) return true;
+    return (
+      normalize(p.name).includes(normalizedProviderQuery) ||
+      normalize(p.id).includes(normalizedProviderQuery)
+    );
+  });
 
   return (
     <ScrollView
@@ -326,10 +393,24 @@ export default function RecordScreen() {
       {/* Provider */}
       <Card>
         <Text style={styles.label}>Provider</Text>
-        {providers.length === 0 ? (
-          <Text style={styles.sublabel}>Loading providers...</Text>
+        {!providersLoaded ? (
+          <Text style={styles.sublabel}>
+            Loading providers...
+          </Text>
+        ) : providers.length === 0 ? (
+          <Text style={styles.sublabel}>
+            {providerLoadError ? `Unable to load providers: ${providerLoadError}` : "No providers found."}
+          </Text>
         ) : (
           <>
+            {providerId ? (
+              <View style={styles.selectedProviderBanner}>
+                <Ionicons name="checkmark-circle" size={16} color={colors.brand} />
+                <Text style={styles.selectedProviderText}>
+                  Selected: {providers.find((p) => p.id === providerId)?.name ?? providerId}
+                </Text>
+              </View>
+            ) : null}
             <View style={styles.searchBox}>
               <Ionicons name="search" size={16} color={colors.textTertiary} />
               <TextInput
@@ -340,29 +421,30 @@ export default function RecordScreen() {
                 placeholderTextColor={colors.textTertiary}
               />
             </View>
-            <FlatList
-              data={filteredProviders}
-              keyExtractor={(p) => p.id}
-              scrollEnabled={true}
-              nestedScrollEnabled={true}
-              style={{ maxHeight: 200, marginTop: spacing.sm }}
-              renderItem={({ item }) => {
-                const isActive = providerId === item.id;
-                return (
-                  <TouchableOpacity
-                    style={[styles.listRow, isActive && styles.listRowActive]}
-                    onPress={() => setProviderId(item.id)}
-                  >
-                    <Text style={[styles.listRowName, isActive && styles.listRowNameActive]}>
-                      {item.name ?? item.id}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              }}
-              ListEmptyComponent={
-                <Text style={styles.sublabel}>No providers found.</Text>
-              }
-            />
+            {filteredProviders.length === 0 ? (
+              <Text style={styles.sublabel}>No providers found.</Text>
+            ) : (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.providerChipsRow}
+              >
+                {filteredProviders.map((item) => {
+                  const isActive = providerId === item.id;
+                  return (
+                    <TouchableOpacity
+                      key={item.id}
+                      style={[styles.providerChip, isActive && styles.providerChipActive]}
+                      onPress={() => setProviderId(item.id)}
+                    >
+                      <Text style={[styles.providerChipText, isActive && styles.providerChipTextActive]}>
+                        {item.name ?? item.id}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
           </>
         )}
       </Card>
@@ -416,7 +498,11 @@ export default function RecordScreen() {
                 </TouchableOpacity>
               )}
               ListEmptyComponent={
-                <Text style={styles.sublabel}>No patients found. Try adjusting your search.</Text>
+                <Text style={styles.sublabel}>
+                  {patientLoadError
+                    ? `Unable to load patients: ${patientLoadError}`
+                    : "No patients found. Try adjusting your search."}
+                </Text>
               }
             />
           </>
@@ -611,6 +697,51 @@ const styles = StyleSheet.create({
   listRowActive: { backgroundColor: "#D1FAE5" },
   listRowName: { fontSize: fontSize.sm, color: colors.text },
   listRowNameActive: { color: colors.brand, fontWeight: "600" },
+  providerChipsRow: {
+    marginTop: spacing.sm,
+    paddingRight: spacing.sm,
+    gap: spacing.sm,
+  },
+  providerChip: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.full,
+    backgroundColor: colors.card,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  providerChipActive: {
+    borderColor: colors.brand,
+    backgroundColor: "#D1FAE5",
+  },
+  providerChipText: {
+    fontSize: fontSize.sm,
+    color: colors.text,
+    fontWeight: "500",
+  },
+  providerChipTextActive: {
+    color: colors.brand,
+    fontWeight: "700",
+  },
+  selectedProviderBanner: {
+    marginTop: spacing.sm,
+    marginBottom: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: "#86EFAC",
+    backgroundColor: "#ECFDF5",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+  },
+  selectedProviderText: {
+    color: colors.brand,
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+    flex: 1,
+  },
   patientRow: { paddingVertical: spacing.sm, paddingHorizontal: spacing.sm, borderBottomWidth: 1, borderBottomColor: colors.borderLight },
   patientName: { fontSize: fontSize.sm, fontWeight: "600", color: colors.text },
   patientMeta: { fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 },

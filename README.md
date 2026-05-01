@@ -5,6 +5,7 @@ Talix is a React Native mobile application tailored for providers and patients, 
 ## Features
 
 - **Secure Authentication**: Microsoft Entra ID (SSO) login flow.
+- **App Review Demo Access**: Dedicated username/password login path for Apple App Review without Microsoft SSO.
 - **Biometric Security**: Persistent biometric lock (Face ID / Touch ID) ensuring secure session management.
 - **Encounters Management**: View and manage patient encounters seamlessly.
 - **Provider Data**: Multi-location data sourcing for providers.
@@ -49,5 +50,6 @@ Talix is a React Native mobile application tailored for providers and patients, 
 4. **Run the App:**
    ```bash
    npx expo start
+   npx expo run:ios --device --configuration Release
    ```
    Use the Expo app on your phone to scan the QR code, or press `i` to open in the iOS simulator, or `a` for the Android emulator.

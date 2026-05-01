@@ -19,11 +19,45 @@ import Badge from "../components/Badge";
 import {
   fetchSample,
   fetchNote,
-  fetchTranscript,
   type SampleDetail,
 } from "../lib/api";
 
-type Tab = "note" | "transcript";
+function toTitleCase(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function formatEncounterTitle(sampleId: string, patientName?: string | null): string {
+  if (patientName && patientName.trim()) return patientName.trim();
+
+  const parts = sampleId.split("_").filter(Boolean);
+  const nameParts = parts.filter((p) => !/^\d+$/.test(p) && !/^\d{4}-\d{2}-\d{2}$/.test(p));
+  if (nameParts.length >= 2) {
+    return toTitleCase(nameParts.slice(0, 2).join(" "));
+  }
+  if (nameParts.length === 1) return toTitleCase(nameParts[0]);
+  return sampleId;
+}
+
+function sanitizeNoteContent(content: string | null): string | null {
+  if (!content) return content;
+  return content
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (/^\*?AI Scribe\s+v\d+/i.test(trimmed)) return false;
+      if (/^\*\*?Pipeline Version:/i.test(trimmed)) return false;
+      if (/^\*\*?ASR:/i.test(trimmed)) return false;
+      return true;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 export default function EncounterDetailScreen({ route }: any) {
   const { sampleId } = route.params as { sampleId: string };
@@ -32,8 +66,6 @@ export default function EncounterDetailScreen({ route }: any) {
 
   const [sample, setSample] = useState<SampleDetail | null>(null);
   const [noteContent, setNoteContent] = useState<string | null>(null);
-  const [transcriptContent, setTranscriptContent] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<Tab>("note");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -49,14 +81,8 @@ export default function EncounterDetailScreen({ route }: any) {
       setSample(s);
 
       const version = s.latest_version ?? undefined;
-
-      const [noteRes, transcriptRes] = await Promise.allSettled([
-        fetchNote(sampleId, version),
-        fetchTranscript(sampleId, version),
-      ]);
-
-      if (noteRes.status === "fulfilled") setNoteContent(noteRes.value.content);
-      if (transcriptRes.status === "fulfilled") setTranscriptContent(transcriptRes.value.content);
+      const noteRes = await fetchNote(sampleId, version);
+      setNoteContent(noteRes.content);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load encounter");
     }
@@ -89,19 +115,18 @@ export default function EncounterDetailScreen({ route }: any) {
   };
 
   const score = sample.quality?.overall;
+  const encounterTitle = formatEncounterTitle(sampleId, sample.patient_context?.patient?.name);
+  const displayNoteContent = sanitizeNoteContent(noteContent);
 
   return (
     <View style={styles.container}>
       {/* Header */}
       <View style={[styles.header, isTablet && styles.tabletHeader]}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.title} numberOfLines={2}>{sampleId}</Text>
+          <Text style={styles.title} numberOfLines={2}>{encounterTitle}</Text>
           <View style={styles.metaRow}>
             <Badge label={sample.mode} variant={sample.mode === "dictation" ? "info" : "success"} />
             <Text style={styles.metaText}>{sample.physician}</Text>
-            {sample.latest_version && (
-              <Text style={styles.metaText}>{sample.latest_version}</Text>
-            )}
           </View>
         </View>
         {score != null && (
@@ -128,60 +153,14 @@ export default function EncounterDetailScreen({ route }: any) {
         </View>
       )}
 
-      {/* Tabs */}
-      <View style={[styles.tabRow, isTablet && styles.tabletTabRow]}>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === "note" && styles.tabActive]}
-          onPress={() => setActiveTab("note")}
-        >
-          <Ionicons name="document-text" size={16} color={activeTab === "note" ? colors.brand : colors.textTertiary} />
-          <Text style={[styles.tabText, activeTab === "note" && styles.tabTextActive]}>Clinical Note</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.tab, activeTab === "transcript" && styles.tabActive]}
-          onPress={() => setActiveTab("transcript")}
-        >
-          <Ionicons name="chatbubbles" size={16} color={activeTab === "transcript" ? colors.brand : colors.textTertiary} />
-          <Text style={[styles.tabText, activeTab === "transcript" && styles.tabTextActive]}>Transcript</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Content — iPad uses split view */}
-      {isTablet ? (
-        <View style={styles.splitView}>
-          <ScrollView style={styles.splitPane} contentContainerStyle={styles.markdownContainer}>
-            <Text style={styles.paneTitle}>Clinical Note</Text>
-            {noteContent ? (
-              <Markdown style={markdownStyles}>{noteContent}</Markdown>
-            ) : (
-              <Text style={styles.emptyContent}>No note available</Text>
-            )}
-          </ScrollView>
-          <View style={styles.splitDivider} />
-          <ScrollView style={styles.splitPane} contentContainerStyle={styles.markdownContainer}>
-            <Text style={styles.paneTitle}>Transcript</Text>
-            {transcriptContent ? (
-              <Text style={styles.transcriptText}>{transcriptContent}</Text>
-            ) : (
-              <Text style={styles.emptyContent}>No transcript available</Text>
-            )}
-          </ScrollView>
-        </View>
-      ) : (
-        <ScrollView contentContainerStyle={styles.markdownContainer}>
-          {activeTab === "note" ? (
-            noteContent ? (
-              <Markdown style={markdownStyles}>{noteContent}</Markdown>
-            ) : (
-              <Text style={styles.emptyContent}>No note available</Text>
-            )
-          ) : transcriptContent ? (
-            <Text style={styles.transcriptText}>{transcriptContent}</Text>
-          ) : (
-            <Text style={styles.emptyContent}>No transcript available</Text>
-          )}
-        </ScrollView>
-      )}
+      <ScrollView contentContainerStyle={[styles.markdownContainer, isTablet && styles.tabletContent]}>
+        <Text style={styles.paneTitle}>Clinical Note</Text>
+        {displayNoteContent ? (
+          <Markdown style={markdownStyles}>{displayNoteContent}</Markdown>
+        ) : (
+          <Text style={styles.emptyContent}>No note available</Text>
+        )}
+      </ScrollView>
     </View>
   );
 }
@@ -244,34 +223,9 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   tabletPatientBar: { maxWidth: 900, alignSelf: "center", width: "100%" },
+  tabletContent: { maxWidth: 900, alignSelf: "center", width: "100%" },
   patientText: { fontSize: fontSize.xs, color: colors.textSecondary },
-  tabRow: {
-    flexDirection: "row",
-    paddingHorizontal: spacing.lg,
-    marginTop: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-  },
-  tabletTabRow: { maxWidth: 900, alignSelf: "center", width: "100%" },
-  tab: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
-    marginRight: spacing.md,
-    borderBottomWidth: 2,
-    borderBottomColor: "transparent",
-    gap: spacing.xs,
-  },
-  tabActive: { borderBottomColor: colors.brand },
-  tabText: { fontSize: fontSize.sm, color: colors.textTertiary, fontWeight: "500" },
-  tabTextActive: { color: colors.brand },
-  markdownContainer: { padding: spacing.lg },
+  markdownContainer: { padding: spacing.lg, marginTop: spacing.md },
   emptyContent: { fontSize: fontSize.sm, color: colors.textTertiary, textAlign: "center", marginTop: 40 },
-  transcriptText: { fontSize: fontSize.sm, color: colors.text, lineHeight: 22 },
-  // iPad split view
-  splitView: { flex: 1, flexDirection: "row" },
-  splitPane: { flex: 1 },
-  splitDivider: { width: 1, backgroundColor: colors.border },
   paneTitle: { fontSize: fontSize.md, fontWeight: "600", color: colors.text, marginBottom: spacing.md },
 });

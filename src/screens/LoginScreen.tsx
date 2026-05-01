@@ -6,6 +6,9 @@ import {
   TouchableOpacity,
   Alert,
   ActivityIndicator,
+  Image,
+  TextInput,
+  Modal,
 } from "react-native";
 import * as WebBrowser from "expo-web-browser";
 import * as AuthSession from "expo-auth-session";
@@ -32,6 +35,8 @@ const ORGANIZATIONS = [
 ];
 
 const SCOPES = ["openid", "profile", "email", "User.Read"];
+const APP_REVIEW_USERNAME = (process.env.EXPO_PUBLIC_APP_REVIEW_USERNAME || "").trim();
+const APP_REVIEW_PASSWORD = process.env.EXPO_PUBLIC_APP_REVIEW_PASSWORD || "";
 
 const redirectUri = AuthSession.makeRedirectUri({
   scheme: "msauth.com.talismansolutions.talixapp",
@@ -44,6 +49,10 @@ export default function LoginScreen() {
   // Which org is selected — null means no org picked yet
   const [selectedOrg, setSelectedOrg] = useState<typeof ORGANIZATIONS[0] | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [showDemoModal, setShowDemoModal] = useState(false);
+  const [demoUsername, setDemoUsername] = useState("");
+  const [demoPassword, setDemoPassword] = useState("");
+  const [isDemoSubmitting, setIsDemoSubmitting] = useState(false);
 
   // Discovery document computed from selected org's tenant
   const discovery: AuthSession.DiscoveryDocument | null = selectedOrg
@@ -132,13 +141,34 @@ export default function LoginScreen() {
 
   // ── Demo login for App Review (Apple reviewer access) ────────────────
   const onDemoLogin = async () => {
-    await login({
-      method: "entra",
-      name: "Demo Reviewer",
-      email: "demo@talismansolutions.com",
-      microsoftId: "demo-reviewer",
-      organization: "Talisman Solutions",
-    });
+    if (!APP_REVIEW_USERNAME || !APP_REVIEW_PASSWORD) {
+      Alert.alert(
+        "Demo Access Not Configured",
+        "App Review credentials are missing. Configure EXPO_PUBLIC_APP_REVIEW_USERNAME and EXPO_PUBLIC_APP_REVIEW_PASSWORD.",
+      );
+      return;
+    }
+
+    if (demoUsername.trim() !== APP_REVIEW_USERNAME || demoPassword !== APP_REVIEW_PASSWORD) {
+      Alert.alert("Invalid Credentials", "Please use the App Review demo credentials shared in Review Notes.");
+      return;
+    }
+
+    try {
+      setIsDemoSubmitting(true);
+      await login({
+        method: "entra",
+        name: "App Review Demo",
+        email: APP_REVIEW_USERNAME,
+        microsoftId: "app-review-demo",
+        organization: "Talix Demo Access",
+      });
+      setShowDemoModal(false);
+      setDemoUsername("");
+      setDemoPassword("");
+    } finally {
+      setIsDemoSubmitting(false);
+    }
   };
 
   // ── When org is selected, launch Microsoft login ──────────────────────
@@ -164,7 +194,7 @@ export default function LoginScreen() {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Ionicons name="medical" size={48} color={colors.brand} />
+        <Image source={require("../../assets/android-icon-foreground.png")} style={styles.brandLogo} />
         <Text style={styles.title}>Talix</Text>
         <Text style={styles.subtitle}>Medical Clinical Documentation</Text>
       </View>
@@ -204,9 +234,69 @@ export default function LoginScreen() {
         Sign in with your organization's Microsoft account to get started.
       </Text>
 
-      <TouchableOpacity onPress={onDemoLogin} style={styles.demoBtn} disabled={isLoading}>
+      <TouchableOpacity
+        onPress={() => setShowDemoModal(true)}
+        style={styles.demoBtn}
+        disabled={isLoading || isDemoSubmitting}
+      >
         <Text style={styles.demoBtnText}>App Review / Demo Access</Text>
       </TouchableOpacity>
+
+      <Modal
+        animationType="fade"
+        transparent
+        visible={showDemoModal}
+        onRequestClose={() => setShowDemoModal(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>App Review / Demo Access</Text>
+            <Text style={styles.modalHint}>
+              Enter the demo credentials provided in App Store Connect Review Notes.
+            </Text>
+
+            <TextInput
+              value={demoUsername}
+              onChangeText={setDemoUsername}
+              placeholder="Demo username"
+              placeholderTextColor={colors.textTertiary}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="email-address"
+              style={styles.demoInput}
+              editable={!isDemoSubmitting}
+            />
+            <TextInput
+              value={demoPassword}
+              onChangeText={setDemoPassword}
+              placeholder="Demo password"
+              placeholderTextColor={colors.textTertiary}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.demoInput}
+              editable={!isDemoSubmitting}
+            />
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => setShowDemoModal(false)}
+                disabled={isDemoSubmitting}
+              >
+                <Text style={styles.modalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalLoginBtn} onPress={onDemoLogin} disabled={isDemoSubmitting}>
+                {isDemoSubmitting ? (
+                  <ActivityIndicator size="small" color={colors.textInverse} />
+                ) : (
+                  <Text style={styles.modalLoginText}>Sign In</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {__DEV__ && (
         <Text style={styles.debugText}>Redirect URI: {redirectUri}</Text>
@@ -231,6 +321,10 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     color: colors.text,
     marginTop: spacing.md,
+  },
+  brandLogo: {
+    width: 56,
+    height: 56,
   },
   subtitle: {
     fontSize: fontSize.md,
@@ -301,6 +395,70 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.textTertiary,
     textDecorationLine: "underline",
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.4)",
+    justifyContent: "center",
+    padding: spacing.lg,
+  },
+  modalCard: {
+    backgroundColor: colors.card,
+    borderRadius: 14,
+    padding: spacing.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  modalTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: "700",
+    color: colors.text,
+  },
+  modalHint: {
+    marginTop: spacing.xs,
+    marginBottom: spacing.md,
+    color: colors.textSecondary,
+    fontSize: fontSize.xs,
+    lineHeight: 18,
+  },
+  demoInput: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 10,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    color: colors.text,
+    fontSize: fontSize.sm,
+    marginBottom: spacing.sm,
+    backgroundColor: colors.bg,
+  },
+  modalActions: {
+    marginTop: spacing.sm,
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: spacing.sm,
+  },
+  modalCancelBtn: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  modalCancelText: {
+    color: colors.textSecondary,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+  },
+  modalLoginBtn: {
+    minWidth: 96,
+    alignItems: "center",
+    backgroundColor: colors.brand,
+    borderRadius: 10,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  modalLoginText: {
+    color: colors.textInverse,
+    fontSize: fontSize.sm,
+    fontWeight: "700",
   },
   debugText: {
     textAlign: "center",

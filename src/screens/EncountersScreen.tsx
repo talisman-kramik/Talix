@@ -23,6 +23,22 @@ import { colors, fontSize, spacing, radius } from "../lib/theme";
 import { fetchSamples, fetchProviders, type SampleSummary, type ProviderSummary } from "../lib/api";
 import { useSettings } from "../store/settings";
 
+function toTitleCase(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function formatEncounterTitle(sampleId: string): string {
+  const parts = sampleId.split("_").filter(Boolean);
+  const nameParts = parts.filter((p) => !/^\d+$/.test(p) && !/^\d{4}-\d{2}-\d{2}$/.test(p));
+  if (nameParts.length >= 2) return toTitleCase(nameParts.slice(0, 2).join(" "));
+  if (nameParts.length === 1) return toTitleCase(nameParts[0]);
+  return sampleId;
+}
+
 export default function EncountersScreen() {
   const nav = useNavigation<any>();
   const { width } = useWindowDimensions();
@@ -98,6 +114,7 @@ export default function EncountersScreen() {
 
   const renderItem = ({ item }: { item: SampleSummary }) => {
     const score = item.quality?.overall;
+    const encounterTitle = formatEncounterTitle(item.sample_id);
     return (
       <TouchableOpacity
         style={[styles.card, isTablet && styles.tabletCard]}
@@ -107,7 +124,7 @@ export default function EncountersScreen() {
         <View style={styles.cardHeader}>
           <View style={styles.cardTitleRow}>
             <Ionicons name="document-text-outline" size={16} color={colors.brand} style={{ marginRight: spacing.xs }} />
-            <Text style={styles.sampleId} numberOfLines={1}>{item.sample_id}</Text>
+            <Text style={styles.sampleId} numberOfLines={1}>{encounterTitle}</Text>
           </View>
           {score != null && (
             <Badge label={score.toFixed(2)} variant={scoreVariant(score)} />
