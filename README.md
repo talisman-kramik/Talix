@@ -53,3 +53,19 @@ Talix is a React Native mobile application tailored for providers and patients, 
    npx expo run:ios --device --configuration Release
    ```
    Use the Expo app on your phone to scan the QR code, or press `i` to open in the iOS simulator, or `a` for the Android emulator.
+
+## Release to TestFlight
+
+Run from the `Talix` folder:
+
+```bash
+git push -u origin main
+eas build --platform ios --profile production
+eas submit --platform ios --profile production --latest
+```
+
+Optional one-line non-interactive command:
+
+```bash
+git push -u origin main && eas build --platform ios --profile production --non-interactive && eas submit --platform ios --profile production --latest --non-interactive
+```

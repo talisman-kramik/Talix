@@ -10,21 +10,25 @@ import {
   TouchableOpacity,
   ScrollView,
   Alert,
+  Platform,
   useWindowDimensions,
   FlatList,
   TextInput,
   ActivityIndicator,
 } from "react-native";
 import { Audio } from "expo-av";
+import * as FileSystem from "expo-file-system/legacy";
 import { Ionicons } from "@expo/vector-icons";
 import { useNavigation } from "@react-navigation/native";
+import DateTimePicker, { DateTimePickerAndroid } from "@react-native-community/datetimepicker";
+import * as DocumentPicker from "expo-document-picker";
 
 import Card from "../components/Card";
 import ProgressBar from "../components/ProgressBar";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import {
   fetchProviders,
-  searchPatients,
+  fetchPatientsByProviderDate,
   createEncounter,
   resolveEncounterProviderId,
   uploadEncounterAudio,
@@ -32,25 +36,102 @@ import {
   type ProviderSummary,
   type PatientSearchResult,
 } from "../lib/api";
-import { useSettings } from "../store/settings";
+import { useSettings, getApiKey, getApiUrl } from "../store/settings";
 import { useOfflineStore } from "../store/offline";
 
-const VISIT_TYPES = [
-  { value: "initial_evaluation", label: "Initial Evaluation" },
-  { value: "follow_up", label: "Follow-up" },
-  { value: "assume_care", label: "Assume Care" },
-  { value: "discharge", label: "Discharge" },
-];
+const FRONTEND_PARITY_VISIT_TYPE = "follow_up";
 
 const MODES = [
   { value: "dictation", label: "Dictation" },
-  { value: "ambient", label: "Ambient" },
+  { value: "ambient", label: "Conversation" },
 ];
 
 type PipelineStage = "idle" | "recording" | "creating" | "uploading" | "processing" | "complete" | "error";
 
 function normalize(value: unknown): string {
   return String(value ?? "").trim().toLowerCase();
+}
+
+function getPatientDisplayName(patient: Pick<PatientSearchResult, "first_name" | "last_name" | "mrn" | "id">): string {
+  const fullName = `${patient.first_name || ""} ${patient.last_name || ""}`.trim();
+  if (fullName) return fullName;
+  if (patient.mrn) return `MRN: ${patient.mrn}`;
+  return patient.id;
+}
+
+function getTodayDateIso(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function parseIsoDate(value: string): Date {
+  const [yearStr, monthStr, dayStr] = value.split("-");
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  if (!year || !month || !day) return new Date();
+  return new Date(year, month - 1, day);
+}
+
+function formatIsoDate(date: Date): string {
+  const y = date.getFullYear();
+  const m = `${date.getMonth() + 1}`.padStart(2, "0");
+  const d = `${date.getDate()}`.padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function formatDateForDisplay(isoDate: string): string {
+  const value = String(isoDate || "").trim();
+  const [yearStr, monthStr, dayStr] = value.split("-");
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  if (!year || !month || !day) return value || "N/A";
+  return `${month}/${day}/${year}`;
+}
+
+function normalizeEncounterIdPart(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    // Keep backend-identifying chars like "." and "-" from Eclipse IDs.
+    // Only collapse whitespace to avoid unsafe URL spacing.
+    .replace(/\s+/g, "");
+}
+
+function makeClientEncounterId(params: {
+  patientCaseId: string;
+  appointmentId: string;
+  providerId: string;
+  dateOfService: string;
+}): string {
+  const patientCasePart = normalizeEncounterIdPart(params.patientCaseId) || "unknown";
+  const datePart = String(params.dateOfService || "").trim().replace(/-/g, "") || "unknown";
+  let appointmentPart = normalizeEncounterIdPart(params.appointmentId) || "unknown";
+  // If appointment id already includes date_of_service suffix, strip it to
+  // avoid duplicate "..._{date}_{date}" encounter ids.
+  if (appointmentPart.endsWith(`_${datePart}`)) {
+    appointmentPart = appointmentPart.slice(0, -(`_${datePart}`.length));
+  }
+  const providerPart = normalizeEncounterIdPart(params.providerId) || "unknown";
+  return `${patientCasePart}_${appointmentPart}_${providerPart}_${datePart}`;
+}
+
+function base64ToUint8Array(base64: string): Uint8Array {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const clean = String(base64 || "").replace(/=+$/, "");
+  let buffer = 0;
+  let bits = 0;
+  const out: number[] = [];
+  for (let i = 0; i < clean.length; i++) {
+    const val = alphabet.indexOf(clean[i]);
+    if (val < 0) continue;
+    buffer = (buffer << 6) | val;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((buffer >> bits) & 0xff);
+    }
+  }
+  return new Uint8Array(out);
 }
 
 export default function RecordScreen() {
@@ -63,21 +144,37 @@ export default function RecordScreen() {
   const [providersLoaded, setProvidersLoaded] = useState(false);
   const [patients, setPatients] = useState<PatientSearchResult[]>([]);
   const [patientQuery, setPatientQuery] = useState("");
+  const [appointmentDate, setAppointmentDate] = useState(getTodayDateIso());
   const [providerQuery, setProviderQuery] = useState("");
   const [providerLoadError, setProviderLoadError] = useState<string | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
+  const [patientsLoading, setPatientsLoading] = useState(false);
 
   // Selections
   const [providerId, setProviderId] = useState("");
   const [selectedPatient, setSelectedPatient] = useState<PatientSearchResult | null>(null);
-  const [visitType, setVisitType] = useState("follow_up");
   const [mode, setMode] = useState("dictation");
 
   // Recording
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
   const [recordingUri, setRecordingUri] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
+  const [audioFilename, setAudioFilename] = useState("recording.m4a");
+  const [noteRecording, setNoteRecording] = useState<Audio.Recording | null>(null);
+  const [noteDuration, setNoteDuration] = useState(0);
+  const [noteAudioUri, setNoteAudioUri] = useState<string | null>(null);
+  const [noteAudioFilename, setNoteAudioFilename] = useState("note_audio.m4a");
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const noteTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [asrStreaming, setAsrStreaming] = useState(false);
+  const [asrPartialText, setAsrPartialText] = useState("");
+  const [asrFinalSegments, setAsrFinalSegments] = useState<string[]>([]);
+  const [asrError, setAsrError] = useState<string | null>(null);
+  const [asrStatus, setAsrStatus] = useState("");
+  const asrWsRef = useRef<WebSocket | null>(null);
+  const asrReadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const asrReadOffsetRef = useRef(0);
+  const asrChunksSentRef = useRef(0);
 
   // Pipeline
   const [stage, setStage] = useState<PipelineStage>("idle");
@@ -116,20 +213,22 @@ export default function RecordScreen() {
       });
   }, [apiUrl]);
 
-  // Patient search — fetch once per provider, filter locally
+  // Patient search — fetch once per provider/date, filter locally
   const [allPatients, setAllPatients] = useState<PatientSearchResult[]>([]);
 
   useEffect(() => {
-    // Only hit the network when providerId changes (or on mount if we want all)
+    // Hit the network when provider/date changes.
     setSelectedPatient(null);
     setPatientQuery("");
     setPatients([]);
     setAllPatients([]);
     setPatientLoadError(null);
+    setPatientsLoading(false);
     if (!providerId) {
       return;
     }
-    searchPatients("", providerId)
+    setPatientsLoading(true);
+    fetchPatientsByProviderDate(providerId, appointmentDate)
       .then((list) => {
         const sortedList = [...list].sort((a, b) =>
           normalize(`${a.last_name} ${a.first_name}`).localeCompare(normalize(`${b.last_name} ${b.first_name}`)),
@@ -139,8 +238,11 @@ export default function RecordScreen() {
       })
       .catch((err) => {
         setPatientLoadError(err instanceof Error ? err.message : "Failed to load patients");
+      })
+      .finally(() => {
+        setPatientsLoading(false);
       });
-  }, [providerId, apiUrl]);
+  }, [providerId, appointmentDate, apiUrl]);
 
   // Local filtering when user types
   useEffect(() => {
@@ -179,25 +281,12 @@ export default function RecordScreen() {
   useEffect(() => {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
+      if (noteTimerRef.current) clearInterval(noteTimerRef.current);
       wsRef.current?.close();
+      if (asrReadIntervalRef.current) clearInterval(asrReadIntervalRef.current);
+      asrWsRef.current?.close();
     };
   }, []);
-
-  // Auto-select Visit Type based on patient's appointment class
-  useEffect(() => {
-    if (selectedPatient?.appointment_class) {
-      const cls = selectedPatient.appointment_class.toLowerCase();
-      if (cls.includes("initial") || cls.includes("eval") || cls.includes("new")) {
-        setVisitType("initial_evaluation");
-      } else if (cls.includes("assume") || cls.includes("transfer")) {
-        setVisitType("assume_care");
-      } else if (cls.includes("discharge")) {
-        setVisitType("discharge");
-      } else {
-        setVisitType("follow_up");
-      }
-    }
-  }, [selectedPatient]);
 
   // ---- Recording ----
   const startRecording = async () => {
@@ -217,8 +306,15 @@ export default function RecordScreen() {
       setRecording(rec);
       setRecordingUri(null);
       setDuration(0);
+      setAudioFilename("recording.m4a");
+      setAsrPartialText("");
+      setAsrFinalSegments([]);
+      setAsrError(null);
+      setAsrStatus("");
       setStage("recording");
       timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
+      const recUri = rec.getURI();
+      if (recUri) startLiveTranscription(recUri, mode);
     } catch (err) {
       Alert.alert("Error", "Could not start recording.");
     }
@@ -232,15 +328,116 @@ export default function RecordScreen() {
     }
     await recording.stopAndUnloadAsync();
     await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+    await stopLiveTranscription();
     const uri = recording.getURI();
     setRecordingUri(uri);
+    setAudioFilename("recording.m4a");
     setRecording(null);
     setStage("idle");
   };
 
+  const pickAudioFile = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "audio/*",
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled || !result.assets?.length) {
+        return;
+      }
+
+      const asset = result.assets[0];
+      if (!asset.uri) return;
+
+      setRecordingUri(asset.uri);
+      setAudioFilename(asset.name || "uploaded-audio.m4a");
+      setDuration(0);
+      setStage("idle");
+    } catch {
+      Alert.alert("Error", "Could not pick audio file.");
+    }
+  };
+
+  const pickNoteAudioFile = async (): Promise<{ uri: string; name: string } | null> => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "audio/*",
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled || !result.assets?.length) return null;
+      const asset = result.assets[0];
+      if (!asset.uri) return null;
+      return { uri: asset.uri, name: asset.name || "note_audio.m4a" };
+    } catch {
+      Alert.alert("Error", "Could not pick notes audio file.");
+      return null;
+    }
+  };
+
+  const startNoteRecording = async () => {
+    try {
+      const perm = await Audio.requestPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert("Permission required", "Microphone access is needed to record notes.");
+        return;
+      }
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+      const { recording: rec } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY,
+      );
+      setNoteRecording(rec);
+      setNoteDuration(0);
+      setNoteAudioUri(null);
+      setNoteAudioFilename("note_audio.m4a");
+      noteTimerRef.current = setInterval(() => setNoteDuration((d) => d + 1), 1000);
+    } catch {
+      Alert.alert("Error", "Could not start notes recording.");
+    }
+  };
+
+  const stopNoteRecording = async () => {
+    if (!noteRecording) return;
+    if (noteTimerRef.current) {
+      clearInterval(noteTimerRef.current);
+      noteTimerRef.current = null;
+    }
+    await noteRecording.stopAndUnloadAsync();
+    await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+    const uri = noteRecording.getURI();
+    const noteName = "note_recording.m4a";
+    setNoteRecording(null);
+    setNoteAudioUri(uri);
+    setNoteAudioFilename(noteName);
+    setNoteDuration(0);
+  };
+
+  const clearNoteAudio = () => {
+    if (noteTimerRef.current) {
+      clearInterval(noteTimerRef.current);
+      noteTimerRef.current = null;
+    }
+    setNoteDuration(0);
+    setNoteAudioUri(null);
+    setNoteAudioFilename("note_audio.m4a");
+    if (noteRecording) {
+      const current = noteRecording;
+      setNoteRecording(null);
+      void current.stopAndUnloadAsync().catch(() => {});
+      void Audio.setAudioModeAsync({ allowsRecordingIOS: false }).catch(() => {});
+    }
+  };
+
   const discardRecording = () => {
+    void stopLiveTranscription();
     setRecordingUri(null);
     setDuration(0);
+    setAudioFilename("recording.m4a");
+    clearNoteAudio();
   };
 
   const formatTime = (s: number) => {
@@ -249,11 +446,110 @@ export default function RecordScreen() {
     return `${m}:${sec.toString().padStart(2, "0")}`;
   };
 
+  const startLiveTranscription = (recordingUri: string, currentMode: string) => {
+    const base = getApiUrl().replace(/\/$/, "");
+    const wsBase = base.replace(/^http/, "ws");
+    const asrId = `live_${Date.now()}`;
+    const key = getApiKey();
+    const wsMode = currentMode === "ambient" ? "ambient" : "dictation";
+    const wsUrl = `${wsBase}/ws/asr/${asrId}?mode=${encodeURIComponent(wsMode)}&format=webm${key ? `&token=${encodeURIComponent(key)}` : ""}`;
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      asrWsRef.current = ws;
+      ws.onopen = () => {
+        setAsrStreaming(true);
+        asrReadOffsetRef.current = 0;
+        asrChunksSentRef.current = 0;
+        setAsrError(null);
+        setAsrStatus("Connected. Listening...");
+        fetch(`${base}/asr/preload?mode=${encodeURIComponent(wsMode)}`, {
+          method: "POST",
+          headers: key ? { Authorization: `Bearer ${key}` } : {},
+        }).catch(() => {});
+
+        asrReadIntervalRef.current = setInterval(async () => {
+          try {
+            const info = (await FileSystem.getInfoAsync(recordingUri, { size: true } as any)) as any;
+            const size = typeof info?.size === "number" ? info.size : 0;
+            const offset = asrReadOffsetRef.current;
+            if (!size || size <= offset) return;
+            const b64 = await FileSystem.readAsStringAsync(recordingUri, {
+              encoding: FileSystem.EncodingType.Base64,
+              position: offset,
+              length: size - offset,
+            } as any);
+            if (!b64) return;
+            const bytes = base64ToUint8Array(b64);
+            if (bytes.byteLength > 0 && asrWsRef.current?.readyState === WebSocket.OPEN) {
+              const payload = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+              asrWsRef.current.send(payload);
+              asrReadOffsetRef.current = size;
+              asrChunksSentRef.current += 1;
+              setAsrStatus("Streaming audio...");
+            }
+          } catch {
+            // Keep recording flow stable even if ASR chunk read fails.
+          }
+        }, 1200);
+
+        setTimeout(() => {
+          if (asrChunksSentRef.current === 0 && asrWsRef.current?.readyState === WebSocket.OPEN) {
+            setAsrError("Live ASR connected but no audio chunks detected yet.");
+          }
+        }, 6000);
+      };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(String(event.data));
+          const partial = String(data.partial || data.text || "").trim();
+          const final = String(data.final || data.segment || data.transcript || "").trim();
+          if (final) {
+            setAsrFinalSegments((prev) => [...prev, final]);
+            setAsrPartialText("");
+            setAsrStatus("Receiving transcript...");
+          } else if (partial) {
+            setAsrPartialText(partial);
+            setAsrStatus("Receiving transcript...");
+          }
+        } catch {
+          const msg = String(event.data || "").trim();
+          if (msg) setAsrPartialText(msg);
+        }
+      };
+      ws.onerror = () => setAsrError("Live transcription connection error");
+      ws.onclose = () => {
+        setAsrStreaming(false);
+        setAsrStatus("");
+      };
+    } catch {
+      setAsrError("Unable to start live transcription");
+    }
+  };
+
+  const stopLiveTranscription = async () => {
+    if (asrReadIntervalRef.current) {
+      clearInterval(asrReadIntervalRef.current);
+      asrReadIntervalRef.current = null;
+    }
+    if (asrWsRef.current && asrWsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        asrWsRef.current.close();
+      } catch {}
+    }
+    asrWsRef.current = null;
+    setAsrStreaming(false);
+    setAsrStatus("");
+  };
+
   // ---- Submit ----
   const canSubmit = providerId && selectedPatient && recordingUri && stage === "idle";
+  const submitButtonLabel = mode === "ambient" ? "Submit Conversation" : "Submit Dictation";
 
-  const handleSubmit = useCallback(async () => {
+  const handleSubmit = useCallback(async (notesOverride?: { uri: string; name: string } | null) => {
     if (!selectedPatient || !recordingUri) return;
+    const effectiveNoteAudioUri = notesOverride?.uri ?? noteAudioUri;
+    const effectiveNoteAudioFilename = notesOverride?.name ?? noteAudioFilename;
 
     // Check connectivity
     const online = await checkConnectivity();
@@ -261,10 +557,10 @@ export default function RecordScreen() {
       await enqueue({
         provider_id: providerId,
         patient_id: selectedPatient.id,
-        visit_type: visitType,
+          visit_type: FRONTEND_PARITY_VISIT_TYPE,
         mode,
         audioUri: recordingUri,
-        filename: "recording.m4a",
+          filename: audioFilename,
       });
       Alert.alert(
         "Saved Offline",
@@ -278,17 +574,44 @@ export default function RecordScreen() {
       setStage("creating");
       setStatusMsg("Creating encounter...");
       setProgress(0);
-
       const selectedProviderName = providers.find((p) => p.id === providerId)?.name;
       const encounterProviderId = await resolveEncounterProviderId(providerId, selectedProviderName);
+      const patientCaseId =
+        String(selectedPatient.patient_case_id || "").trim() ||
+        String(selectedPatient.mrn || "").trim() ||
+        String(selectedPatient.id || "").trim();
+      const patientNameForRequest = `${selectedPatient.first_name || ""} ${selectedPatient.last_name || ""}`.trim();
+      const appointmentId =
+        String(selectedPatient.appointment_id || "").trim() ||
+        String(selectedPatient.id || "").trim();
+      const providerIdCandidate =
+        String(selectedPatient.provider_source_id || "").trim() ||
+        String(encounterProviderId || "").trim() ||
+        String(providerId || "").trim();
+      const providerIdForEncounter = providerIdCandidate.startsWith("name:")
+        ? providerIdCandidate.replace(/^name:/, "")
+        : providerIdCandidate;
+      const clientEncounterId = makeClientEncounterId({
+        patientCaseId,
+        appointmentId,
+        providerId: providerIdForEncounter,
+        dateOfService: appointmentDate,
+      });
 
       let enc;
       try {
         enc = await createEncounter({
+          encounter_id: clientEncounterId,
           provider_id: encounterProviderId,
           patient_id: selectedPatient.id,
-          visit_type: visitType,
+          patient_name: patientNameForRequest || undefined,
+            visit_type: FRONTEND_PARITY_VISIT_TYPE,
           mode,
+          date_of_service: appointmentDate,
+          created_at: new Date().toISOString(),
+          audio_file: audioFilename,
+          note_audio_file: effectiveNoteAudioUri ? effectiveNoteAudioFilename : null,
+          has_gold_standard: false,
         });
       } catch (err) {
         // Retry once with a known-valid fallback provider for stability if mapping is rejected.
@@ -298,18 +621,27 @@ export default function RecordScreen() {
           err.message.includes("500")
         ) {
           enc = await createEncounter({
+            encounter_id: clientEncounterId,
             provider_id: "dr_caleb_ademiloye",
             patient_id: selectedPatient.id,
-            visit_type: visitType,
+            patient_name: patientNameForRequest || undefined,
+              visit_type: FRONTEND_PARITY_VISIT_TYPE,
             mode,
+            date_of_service: appointmentDate,
+            created_at: new Date().toISOString(),
+            audio_file: audioFilename,
+            note_audio_file: effectiveNoteAudioUri ? effectiveNoteAudioFilename : null,
+            has_gold_standard: false,
           });
         } else {
           throw err;
         }
       }
 
+      const effectiveEncounterId = enc.encounter_id || clientEncounterId;
+
       // Connect WebSocket for progress
-      const ws = new WebSocket(`${getWsUrl()}/ws/encounters/${enc.encounter_id}`);
+      const ws = new WebSocket(`${getWsUrl()}/ws/encounters/${effectiveEncounterId}`);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -340,7 +672,13 @@ export default function RecordScreen() {
       setStatusMsg("Uploading audio...");
       setProgress(5);
 
-      const result = await uploadEncounterAudio(enc.encounter_id, recordingUri, "recording.m4a");
+      const result = await uploadEncounterAudio(
+        effectiveEncounterId,
+        recordingUri,
+        audioFilename,
+        effectiveNoteAudioUri,
+        effectiveNoteAudioFilename,
+      );
 
       setStage("processing");
       setStatusMsg(result.message ?? "Pipeline running...");
@@ -350,7 +688,71 @@ export default function RecordScreen() {
       setStage("error");
       setStatusMsg(err instanceof Error ? err.message : "Unknown error");
     }
-  }, [providerId, selectedPatient, recordingUri, visitType, mode, stage, checkConnectivity, enqueue]);
+  }, [
+    providerId,
+    selectedPatient,
+    recordingUri,
+    mode,
+    stage,
+    checkConnectivity,
+    enqueue,
+    audioFilename,
+    noteAudioUri,
+    noteAudioFilename,
+  ]);
+
+  const handleSubmitPress = useCallback(() => {
+    if (mode !== "ambient") {
+      void handleSubmit();
+      return;
+    }
+    if (noteRecording) {
+      Alert.alert("Notes recording in progress", "Stop notes recording before submitting.");
+      return;
+    }
+    if (noteAudioUri) {
+      void handleSubmit({ uri: noteAudioUri, name: noteAudioFilename });
+      return;
+    }
+
+    Alert.alert(
+      "Add Conversation Notes?",
+      "Would you like to add notes before submitting this conversation?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "No, Submit Without Notes",
+          onPress: () => {
+            clearNoteAudio();
+            void handleSubmit();
+          },
+        },
+        {
+          text: "Yes, Add Notes",
+          onPress: () => {
+            Alert.alert("Add Notes", "How would you like to add notes?", [
+              { text: "Cancel", style: "cancel" },
+              {
+                text: "Record Notes",
+                onPress: () => {
+                  void startNoteRecording();
+                },
+              },
+              {
+                text: "Upload Notes",
+                onPress: async () => {
+                  const picked = await pickNoteAudioFile();
+                  if (!picked) return;
+                  setNoteAudioUri(picked.uri);
+                  setNoteAudioFilename(picked.name);
+                },
+              },
+            ]);
+          },
+        },
+      ],
+    );
+  }, [mode, handleSubmit, noteAudioUri, noteAudioFilename, noteRecording]);
 
   const resetForm = () => {
     setStage("idle");
@@ -421,29 +823,73 @@ export default function RecordScreen() {
                 placeholderTextColor={colors.textTertiary}
               />
             </View>
-            {filteredProviders.length === 0 ? (
-              <Text style={styles.sublabel}>No providers found.</Text>
+            <Text style={styles.providerCountText}>
+              Showing {filteredProviders.length} of {providers.length} providers
+            </Text>
+            <FlatList
+              data={filteredProviders}
+              keyExtractor={(p) => p.id}
+              style={styles.providerList}
+              horizontal
+              nestedScrollEnabled
+              keyboardShouldPersistTaps="handled"
+              showsHorizontalScrollIndicator
+              renderItem={({ item }) => {
+                const isActive = providerId === item.id;
+                return (
+                  <TouchableOpacity
+                    style={[styles.providerListRow, isActive && styles.providerListRowActive]}
+                    onPress={() => setProviderId(item.id)}
+                  >
+                    <Text style={[styles.providerListName, isActive && styles.providerListNameActive]}>
+                      {item.name ?? item.id}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              }}
+              ListEmptyComponent={
+                <Text style={styles.sublabel}>No providers found.</Text>
+              }
+            />
+            <Text style={styles.dateLabel}>Appointment Date</Text>
+            {Platform.OS === "ios" ? (
+              <View style={styles.iosDatePickerCompactWrap}>
+                <DateTimePicker
+                  value={parseIsoDate(appointmentDate)}
+                  mode="date"
+                  display="compact"
+                  style={styles.iosDatePickerCompact}
+                  onChange={(_event, selectedDate) => {
+                    if (selectedDate) {
+                      setAppointmentDate(formatIsoDate(selectedDate));
+                    }
+                  }}
+                  maximumDate={new Date(2100, 11, 31)}
+                  minimumDate={new Date(2000, 0, 1)}
+                />
+              </View>
             ) : (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={styles.providerChipsRow}
+              <TouchableOpacity
+                style={styles.datePickerButton}
+                onPress={() => {
+                  // Android opens native date picker dialog directly.
+                  DateTimePickerAndroid.open({
+                    value: parseIsoDate(appointmentDate),
+                    mode: "date",
+                    onChange: (_event, selectedDate) => {
+                      if (selectedDate) {
+                        setAppointmentDate(formatIsoDate(selectedDate));
+                      }
+                    },
+                    maximumDate: new Date(2100, 11, 31),
+                    minimumDate: new Date(2000, 0, 1),
+                  });
+                }}
               >
-                {filteredProviders.map((item) => {
-                  const isActive = providerId === item.id;
-                  return (
-                    <TouchableOpacity
-                      key={item.id}
-                      style={[styles.providerChip, isActive && styles.providerChipActive]}
-                      onPress={() => setProviderId(item.id)}
-                    >
-                      <Text style={[styles.providerChipText, isActive && styles.providerChipTextActive]}>
-                        {item.name ?? item.id}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
+                <Ionicons name="calendar-outline" size={16} color={colors.textTertiary} />
+                <Text style={styles.datePickerText}>{appointmentDate}</Text>
+                <Ionicons name="chevron-down" size={16} color={colors.textTertiary} />
+              </TouchableOpacity>
             )}
           </>
         )}
@@ -456,7 +902,7 @@ export default function RecordScreen() {
           <View style={styles.selectedPatient}>
             <View style={{ flex: 1 }}>
               <Text style={styles.patientName}>
-                {selectedPatient.first_name} {selectedPatient.last_name}
+                {getPatientDisplayName(selectedPatient)}
               </Text>
               <Text style={styles.patientMeta}>
                 MRN: {selectedPatient.mrn} · DOB: {selectedPatient.date_of_birth}
@@ -481,16 +927,22 @@ export default function RecordScreen() {
                 placeholderTextColor={colors.textTertiary}
               />
             </View>
+            {patientsLoading && (
+              <View style={styles.patientLoadingRow}>
+                <ActivityIndicator size="small" color={colors.brand} />
+                <Text style={styles.patientLoadingText}>Loading patients for selected provider...</Text>
+              </View>
+            )}
             <FlatList
               data={patients}
               keyExtractor={(p) => p.id}
-              scrollEnabled={true}
-              nestedScrollEnabled={true}
+              scrollEnabled
+              nestedScrollEnabled
               style={{ maxHeight: 250, marginTop: spacing.sm }}
               renderItem={({ item }) => (
                 <TouchableOpacity style={styles.patientRow} onPress={() => setSelectedPatient(item)}>
                   <Text style={styles.patientName}>
-                    {item.first_name} {item.last_name}
+                    {getPatientDisplayName(item)}
                   </Text>
                   <Text style={styles.patientMeta}>
                     MRN: {item.mrn} · {item.sex} · {item.date_of_birth}
@@ -499,7 +951,9 @@ export default function RecordScreen() {
               )}
               ListEmptyComponent={
                 <Text style={styles.sublabel}>
-                  {patientLoadError
+                  {patientsLoading
+                    ? "Loading patients..."
+                    : patientLoadError
                     ? `Unable to load patients: ${patientLoadError}`
                     : "No patients found. Try adjusting your search."}
                 </Text>
@@ -511,39 +965,47 @@ export default function RecordScreen() {
 
       {/* Visit type + mode */}
       <Card>
-        <Text style={styles.label}>Visit Details</Text>
-        <View style={[styles.row, { marginTop: spacing.sm }]}>
-          <View style={{ flex: 1, marginRight: spacing.sm }}>
-            <Text style={styles.sublabel}>Type</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-              {VISIT_TYPES.map((v) => (
-                <TouchableOpacity
-                  key={v.value}
-                  onPress={() => setVisitType(v.value)}
-                  style={[styles.chip, visitType === v.value && styles.chipActive]}
-                >
-                  <Text style={[styles.chipText, visitType === v.value && styles.chipTextActive]}>
-                    {v.label}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-          </View>
+        <Text style={styles.label}>Encounter Details</Text>
+        <View style={styles.detailsBlock}>
+          <Text style={styles.detailLine}>
+            <Text style={styles.detailLabel}>Date of Service: </Text>
+            {formatDateForDisplay(appointmentDate)}
+          </Text>
+          <Text style={styles.detailLine}>
+            <Text style={styles.detailLabel}>Location: </Text>
+            {"Pennsylvania"}
+          </Text>
+          <Text style={styles.detailLine}>
+            <Text style={styles.detailLabel}>Name: </Text>
+            {selectedPatient ? getPatientDisplayName(selectedPatient) : "Not selected"}
+          </Text>
+          <Text style={styles.detailLine}>
+            <Text style={styles.detailLabel}>Provider: </Text>
+            {(providers.find((p) => p.id === providerId)?.name ?? providerId) || "N/A"}
+          </Text>
+          <Text style={styles.detailLine}>
+            <Text style={styles.detailLabel}>Date of Birth: </Text>
+            {selectedPatient?.date_of_birth || "N/A"}
+          </Text>
         </View>
+
         <View style={{ marginTop: spacing.md }}>
           <Text style={styles.sublabel}>Mode</Text>
-          <View style={styles.row}>
-            {MODES.map((m) => (
-              <TouchableOpacity
-                key={m.value}
-                onPress={() => setMode(m.value)}
-                style={[styles.chip, mode === m.value && styles.chipActive]}
-              >
-                <Text style={[styles.chipText, mode === m.value && styles.chipTextActive]}>
-                  {m.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
+          <View style={styles.modeOptionsRow}>
+            {MODES.map((m) => {
+              const active = mode === m.value;
+              return (
+                <TouchableOpacity
+                  key={m.value}
+                  onPress={() => setMode(m.value)}
+                  style={[styles.modeOptionCard, active && styles.modeOptionCardActive]}
+                >
+                  <Text style={[styles.modeOptionTitle, active && styles.modeOptionTitleActive]}>
+                    {m.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
           </View>
         </View>
       </Card>
@@ -554,29 +1016,42 @@ export default function RecordScreen() {
 
         {!recordingUri ? (
           <View style={styles.recordSection}>
-            <TouchableOpacity
-              style={[styles.recordBtn, stage === "recording" && styles.recordBtnActive]}
-              onPress={stage === "recording" ? stopRecording : startRecording}
-              disabled={stage !== "idle" && stage !== "recording"}
-            >
-              <Ionicons
-                name={stage === "recording" ? "stop" : "mic"}
-                size={32}
-                color={colors.textInverse}
-              />
-            </TouchableOpacity>
-            <View style={{ marginLeft: spacing.lg }}>
-              {stage === "recording" ? (
-                <>
-                  <View style={styles.row}>
-                    <View style={styles.pulseDot} />
-                    <Text style={[styles.recordingLabel, { color: colors.error }]}>Recording...</Text>
-                  </View>
-                  <Text style={styles.timer}>{formatTime(duration)}</Text>
-                </>
-              ) : (
-                <Text style={styles.tapToRecord}>Tap to start recording</Text>
-              )}
+            <View style={{ flex: 1 }}>
+              <TouchableOpacity
+                style={[styles.recordBtn, stage === "recording" && styles.recordBtnActive]}
+                onPress={stage === "recording" ? stopRecording : startRecording}
+                disabled={stage !== "idle" && stage !== "recording"}
+              >
+                <Ionicons
+                  name={stage === "recording" ? "stop" : "mic"}
+                  size={32}
+                  color={colors.textInverse}
+                />
+              </TouchableOpacity>
+              <View style={{ marginTop: spacing.sm }}>
+                {stage === "recording" ? (
+                  <>
+                    <View style={styles.row}>
+                      <View style={styles.pulseDot} />
+                      <Text style={[styles.recordingLabel, { color: colors.error }]}>Recording...</Text>
+                    </View>
+                    <Text style={styles.timer}>{formatTime(duration)}</Text>
+                  </>
+                ) : (
+                  <Text style={styles.tapToRecord}>Tap to start recording</Text>
+                )}
+              </View>
+            </View>
+            <View style={{ marginLeft: spacing.md }}>
+              <TouchableOpacity
+                style={styles.uploadBtn}
+                onPress={pickAudioFile}
+                disabled={stage === "recording"}
+              >
+                <Ionicons name="cloud-upload-outline" size={16} color={colors.text} />
+                <Text style={styles.uploadBtnText}>Upload Audio</Text>
+              </TouchableOpacity>
+              <Text style={styles.uploadHint}>Use an existing audio file</Text>
             </View>
           </View>
         ) : (
@@ -584,12 +1059,103 @@ export default function RecordScreen() {
             <Ionicons name="document-text" size={22} color={colors.brand} />
             <View style={{ flex: 1, marginLeft: spacing.sm }}>
               <Text style={{ fontSize: fontSize.sm, fontWeight: "600", color: colors.text }}>
-                Audio ready ({formatTime(duration)})
+                Audio ready{duration > 0 ? ` (${formatTime(duration)})` : ""}
               </Text>
+              <Text style={{ fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 }}>{audioFilename}</Text>
+              {mode === "ambient" && noteAudioUri ? (
+                <Text style={{ fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 }}>
+                  Notes audio: {noteAudioFilename}
+                </Text>
+              ) : null}
             </View>
             <TouchableOpacity onPress={discardRecording}>
               <Ionicons name="close-circle" size={22} color={colors.textTertiary} />
             </TouchableOpacity>
+          </View>
+        )}
+        {mode === "ambient" && recordingUri ? (
+          <View style={styles.noteControls}>
+            <Text style={styles.sublabel}>Conversation Notes</Text>
+            {noteRecording ? (
+              <>
+                <View style={styles.row}>
+                  <View style={styles.pulseDot} />
+                  <Text style={[styles.recordingLabel, { color: colors.error }]}>
+                    Recording notes... {formatTime(noteDuration)}
+                  </Text>
+                </View>
+                <View style={[styles.row, { marginTop: spacing.sm }]}>
+                  <TouchableOpacity style={styles.uploadBtn} onPress={stopNoteRecording}>
+                    <Ionicons name="stop" size={16} color={colors.text} />
+                    <Text style={styles.uploadBtnText}>Stop Notes</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.uploadBtn, { marginLeft: spacing.sm }]} onPress={clearNoteAudio}>
+                    <Ionicons name="trash-outline" size={16} color={colors.text} />
+                    <Text style={styles.uploadBtnText}>Discard</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            ) : noteAudioUri ? (
+              <>
+                <Text style={{ fontSize: fontSize.xs, color: colors.textSecondary }}>
+                  Notes audio ready: {noteAudioFilename}
+                </Text>
+                <View style={[styles.row, { marginTop: spacing.sm }]}>
+                  <TouchableOpacity
+                    style={styles.uploadBtn}
+                    onPress={async () => {
+                      const picked = await pickNoteAudioFile();
+                      if (!picked) return;
+                      setNoteAudioUri(picked.uri);
+                      setNoteAudioFilename(picked.name);
+                    }}
+                  >
+                    <Ionicons name="cloud-upload-outline" size={16} color={colors.text} />
+                    <Text style={styles.uploadBtnText}>Replace (Upload)</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.uploadBtn, { marginLeft: spacing.sm }]} onPress={startNoteRecording}>
+                    <Ionicons name="mic" size={16} color={colors.text} />
+                    <Text style={styles.uploadBtnText}>Replace (Record)</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            ) : (
+              <View style={styles.row}>
+                <TouchableOpacity style={styles.uploadBtn} onPress={startNoteRecording}>
+                  <Ionicons name="mic" size={16} color={colors.text} />
+                  <Text style={styles.uploadBtnText}>Record Notes</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.uploadBtn, { marginLeft: spacing.sm }]}
+                  onPress={async () => {
+                    const picked = await pickNoteAudioFile();
+                    if (!picked) return;
+                    setNoteAudioUri(picked.uri);
+                    setNoteAudioFilename(picked.name);
+                  }}
+                >
+                  <Ionicons name="cloud-upload-outline" size={16} color={colors.text} />
+                  <Text style={styles.uploadBtnText}>Upload Notes</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        ) : null}
+        {(asrStreaming || asrPartialText || asrFinalSegments.length > 0 || asrError) && (
+          <View style={{ marginTop: spacing.md, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: spacing.sm }}>
+            <Text style={styles.sublabel}>Live Transcript</Text>
+            {asrError ? <Text style={{ color: colors.error, fontSize: fontSize.xs }}>{asrError}</Text> : null}
+            {!asrError && asrStatus ? (
+              <Text style={{ color: colors.textSecondary, fontSize: fontSize.xs }}>{asrStatus}</Text>
+            ) : null}
+            {asrPartialText ? (
+              <Text style={{ color: colors.textSecondary, fontSize: fontSize.xs }}>{asrPartialText}</Text>
+            ) : null}
+            {asrFinalSegments.slice(-3).map((seg, idx) => (
+              <Text key={`${idx}-${seg.slice(0, 10)}`} style={{ color: colors.text, fontSize: fontSize.xs, marginTop: 2 }}>
+                {seg}
+              </Text>
+            ))}
           </View>
         )}
       </Card>
@@ -598,10 +1164,10 @@ export default function RecordScreen() {
       {stage === "idle" && (
         <TouchableOpacity
           style={[styles.submitBtn, !canSubmit && styles.submitBtnDisabled]}
-          onPress={handleSubmit}
+          onPress={handleSubmitPress}
           disabled={!canSubmit}
         >
-          <Text style={styles.submitBtnText}>Run Pipeline</Text>
+          <Text style={styles.submitBtnText}>{submitButtonLabel}</Text>
         </TouchableOpacity>
       )}
 
@@ -682,6 +1248,57 @@ const styles = StyleSheet.create({
   chipActive: { backgroundColor: colors.brand, borderColor: colors.brand },
   chipText: { fontSize: fontSize.xs, color: colors.textSecondary, fontWeight: "500" },
   chipTextActive: { color: colors.textInverse },
+  detailsBlock: {
+    marginTop: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    gap: 4,
+  },
+  detailLine: {
+    fontSize: fontSize.sm,
+    color: colors.text,
+  },
+  detailLabel: {
+    color: colors.textSecondary,
+    fontWeight: "600",
+  },
+  modeOptionsRow: {
+    flexDirection: "row",
+    gap: spacing.sm,
+  },
+  modeOptionCard: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  modeOptionCardActive: {
+    borderColor: colors.brand,
+    backgroundColor: "#ECFDF5",
+  },
+  modeOptionTitle: {
+    fontSize: fontSize.sm,
+    color: colors.text,
+    fontWeight: "700",
+  },
+  modeOptionTitleActive: {
+    color: colors.brand,
+  },
+  modeOptionDesc: {
+    marginTop: 2,
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+    fontWeight: "500",
+  },
+  modeOptionDescActive: {
+    color: colors.brand,
+  },
   searchBox: {
     flexDirection: "row",
     alignItems: "center",
@@ -693,35 +1310,75 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   searchInput: { flex: 1, paddingVertical: spacing.sm, marginLeft: spacing.sm, fontSize: fontSize.sm, color: colors.text },
-  listRow: { paddingVertical: spacing.sm, paddingHorizontal: spacing.sm, borderRadius: radius.sm },
-  listRowActive: { backgroundColor: "#D1FAE5" },
-  listRowName: { fontSize: fontSize.sm, color: colors.text },
-  listRowNameActive: { color: colors.brand, fontWeight: "600" },
-  providerChipsRow: {
-    marginTop: spacing.sm,
-    paddingRight: spacing.sm,
-    gap: spacing.sm,
+  dateLabel: {
+    marginTop: spacing.xs,
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+    fontWeight: "500",
   },
-  providerChip: {
+  datePickerButton: {
+    flexDirection: "row",
+    alignItems: "center",
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: radius.full,
+    borderRadius: radius.md,
     backgroundColor: colors.card,
     paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
+    height: 42,
+    marginTop: spacing.xs,
+    marginBottom: spacing.xs,
   },
-  providerChipActive: {
-    borderColor: colors.brand,
-    backgroundColor: "#D1FAE5",
-  },
-  providerChipText: {
+  datePickerText: {
+    flex: 1,
+    marginLeft: spacing.sm,
     fontSize: fontSize.sm,
     color: colors.text,
     fontWeight: "500",
   },
-  providerChipTextActive: {
+  iosDatePickerCompactWrap: {
+    marginTop: spacing.xs,
+    marginLeft: -20,
+    alignSelf: "flex-start",
+  },
+  iosDatePickerCompact: {
+    transform: [{ scale: 0.85 }],
+  },
+  listRow: { paddingVertical: spacing.sm, paddingHorizontal: spacing.sm, borderRadius: radius.sm },
+  listRowActive: { backgroundColor: "#D1FAE5" },
+  listRowName: { fontSize: fontSize.sm, color: colors.text },
+  listRowNameActive: { color: colors.brand, fontWeight: "600" },
+  providerCountText: {
+    marginTop: spacing.xs,
+    marginBottom: spacing.xs,
+    fontSize: fontSize.xs,
+    color: colors.textTertiary,
+    fontWeight: "500",
+  },
+  providerList: {
+    marginTop: spacing.xs,
+    maxHeight: 92,
+  },
+  providerListRow: {
+    minWidth: 180,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    backgroundColor: colors.card,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginRight: spacing.sm,
+  },
+  providerListRowActive: {
+    borderColor: colors.brand,
+    backgroundColor: "#D1FAE5",
+  },
+  providerListName: {
+    fontSize: fontSize.sm,
+    color: colors.text,
+    fontWeight: "600",
+  },
+  providerListNameActive: {
     color: colors.brand,
-    fontWeight: "700",
   },
   selectedProviderBanner: {
     marginTop: spacing.sm,
@@ -742,7 +1399,24 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     flex: 1,
   },
-  patientRow: { paddingVertical: spacing.sm, paddingHorizontal: spacing.sm, borderBottomWidth: 1, borderBottomColor: colors.borderLight },
+  patientRow: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.borderLight,
+  },
+  patientLoadingRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginTop: spacing.xs,
+    marginBottom: spacing.xs,
+  },
+  patientLoadingText: {
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+    fontWeight: "500",
+  },
   patientName: { fontSize: fontSize.sm, fontWeight: "600", color: colors.text },
   patientMeta: { fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 },
   selectedPatient: {
@@ -767,6 +1441,28 @@ const styles = StyleSheet.create({
   recordingLabel: { fontSize: fontSize.sm, fontWeight: "600" },
   timer: { fontSize: fontSize.xxl, fontWeight: "700", fontVariant: ["tabular-nums"], color: colors.text, marginTop: 2 },
   tapToRecord: { fontSize: fontSize.sm, color: colors.textSecondary },
+  uploadBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    backgroundColor: colors.card,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    gap: spacing.xs,
+  },
+  uploadBtnText: {
+    fontSize: fontSize.xs,
+    color: colors.text,
+    fontWeight: "600",
+  },
+  uploadHint: {
+    marginTop: spacing.xs,
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+    maxWidth: 140,
+  },
   recordedRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -774,6 +1470,12 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     padding: spacing.md,
     marginTop: spacing.md,
+  },
+  noteControls: {
+    marginTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingTop: spacing.sm,
   },
   submitBtn: {
     backgroundColor: colors.brand,

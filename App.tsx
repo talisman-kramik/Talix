@@ -23,7 +23,6 @@ import BiometricLockScreen from "./src/screens/BiometricLockScreen";
 import RecordScreen from "./src/screens/RecordScreen";
 import EncountersScreen from "./src/screens/EncountersScreen";
 import EncounterDetailScreen from "./src/screens/EncounterDetailScreen";
-import ProvidersScreen from "./src/screens/ProvidersScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
 import { colors, fontSize, spacing } from "./src/lib/theme";
 import { useSettings } from "./src/store/settings";
@@ -180,7 +179,6 @@ export default function App() {
             const icons: Record<string, keyof typeof Ionicons.glyphMap> = {
               Record: "mic",
               Encounters: "list",
-              Providers: "people",
               Settings: "settings",
             };
             return <Ionicons name={icons[route.name] ?? "ellipse"} size={size} color={color} />;
@@ -193,7 +191,6 @@ export default function App() {
           component={EncountersStackScreen}
           options={{ headerShown: false }}
         />
-        <Tab.Screen name="Providers" component={ProvidersScreen} />
         <Tab.Screen name="Settings" component={SettingsScreen} />
       </Tab.Navigator>
     </NavigationContainer>

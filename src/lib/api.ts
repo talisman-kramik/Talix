@@ -4,6 +4,7 @@
  */
 
 import { getApiUrl, getApiKey } from "../store/settings";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 // ---------------------------------------------------------------------------
 // Types (mirroring web app)
@@ -73,7 +74,34 @@ export interface PatientSearchResult {
   mrn: string;
   practice_id: string;
   appointment_class?: string;
+  patient_case_id?: string;
+  appointment_id?: string;
+  provider_source_id?: string;
 }
+
+function isLikelyNoisyPatientRow(patient: PatientSearchResult): boolean {
+  const first = String(patient.first_name || "").trim();
+  const last = String(patient.last_name || "").trim();
+  const mrn = String(patient.mrn || "").trim().toUpperCase();
+  const dob = String(patient.date_of_birth || "").trim().toLowerCase();
+  const sex = String(patient.sex || "").trim().toLowerCase();
+
+  // Eclipse feed sometimes emits synthetic/system rows (e.g. AMM_LIVE...)
+  // without usable demographics. Hide those from patient picker.
+  const hasNoName = !first && !last;
+  const hasSystemMrnPrefix = mrn.startsWith("AMM_");
+  const hasUnknownDemographics =
+    (!dob || dob === "unknown" || dob === "n/a") &&
+    (!sex || sex === "unknown" || sex === "n/a");
+
+  // Hide AMM_* rows even if names are partially present; these are
+  // operational/system entries in the Pennsylvania Eclipse feed.
+  if (hasSystemMrnPrefix) return true;
+
+  return hasNoName && hasUnknownDemographics;
+}
+
+const DEFAULT_LOCATION = (process.env.EXPO_PUBLIC_AI_SCRIBE_LOCATION ?? "pennsylvania").trim();
 
 function normalizeText(value: unknown): string {
   return String(value ?? "").trim().toLowerCase();
@@ -87,10 +115,12 @@ function normalizeProviderMatch(value: unknown): string {
     .trim();
 }
 
-const KNOWN_BAD_PIPELINE_PROVIDER_IDS = new Set(["dr_scott_pello", "default", "Peter Tatum"]);
+// Provider IDs that should never be sent to the pipeline backend.
+// Keep this list minimal — it affects which provider_id is stored on encounters.
+const KNOWN_BAD_PIPELINE_PROVIDER_IDS = new Set(["default", "Peter Tatum"]);
 const SAFE_PIPELINE_FALLBACK_PROVIDER_ID = "dr_caleb_ademiloye";
 
-function sortByName<T extends { first_name?: string; last_name?: string; name?: string; id: string }>(
+function sortByName<T extends { first_name?: string; last_name?: string; name?: string | null; id: string }>(
   items: T[],
 ): T[] {
   return [...items].sort((a, b) => {
@@ -223,6 +253,45 @@ function getEclipseConfig() {
   };
 }
 
+function normalizeEclipseNamePart(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function makeEclipseProviderId(firstName: string, lastName: string): string {
+  // Encode the provider name directly into the id so we can later fetch patients
+  // without any extra server-side mapping/cache.
+  const first = normalizeEclipseNamePart(firstName);
+  const last = normalizeEclipseNamePart(lastName);
+  return `eclname:${encodeURIComponent(first)}|${encodeURIComponent(last)}`;
+}
+
+function parseEclipseProviderId(providerId: string): { first: string; last: string } | null {
+  if (!providerId.startsWith("eclname:")) return null;
+  const raw = providerId.slice("eclname:".length);
+  const [firstEnc, lastEnc] = raw.split("|");
+  if (!firstEnc && !lastEnc) return null;
+  return {
+    first: decodeURIComponent(firstEnc || "").trim(),
+    last: decodeURIComponent(lastEnc || "").trim(),
+  };
+}
+
+type EclipseProviderRow = {
+  appointment_provider_id?: number | string;
+  provider_first_name?: string;
+  provider_last_name?: string;
+};
+
+const ECLIPSE_ROWS_TTL_MS = 2 * 60 * 1000; // 2 minutes
+const ECLIPSE_PROVIDERS_CACHE_KEY = "talix.eclipse.providers.v1";
+let eclipseProvidersCache:
+  | {
+      providers: ProviderSummary[];
+      fetchedAt: number;
+    }
+  | null = null;
+let eclipseProvidersInFlight: Promise<ProviderSummary[]> | null = null;
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -233,8 +302,137 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000
   }
 }
 
+async function fetchEclipseQueryExec(
+  endpointBase: string,
+  token: string,
+  params: Record<string, string>,
+  options?: { perPage?: number; maxPages?: number; timeoutMs?: number; retries?: number },
+): Promise<any[]> {
+  const perPage = options?.perPage ?? 2000;
+  const maxPages = options?.maxPages ?? 20;
+  const timeoutMs = options?.timeoutMs ?? 60000;
+  const retries = options?.retries ?? 3;
+
+  const allRows: any[] = [];
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const search = new URLSearchParams();
+    search.append("perPage", String(perPage));
+    search.append("page", String(page));
+    for (const [k, v] of Object.entries(params)) search.append(k, v);
+
+    const url = `${endpointBase}?${search.toString()}`;
+
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < retries; attempt += 1) {
+      try {
+        const res = await fetchWithTimeout(
+          url,
+          {
+            headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+          },
+          timeoutMs,
+        );
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          throw new Error(`Eclipse exec failed (${res.status}) ${body}`.trim());
+        }
+        const json = await res.json();
+        const rows = Array.isArray((json as any)?.data) ? (json as any).data : [];
+        allRows.push(...rows);
+
+        // last page
+        if (rows.length < perPage) return allRows;
+        break;
+      } catch (err) {
+        lastErr = err;
+        // exponential backoff: 1s, 2s, 4s (+ jitter)
+        const delayMs = Math.min(4000, 1000 * 2 ** attempt) + Math.floor(Math.random() * 250);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+
+    if (lastErr) {
+      throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    }
+  }
+
+  return allRows;
+}
+
+async function fetchEclipseQueryExecOnce(
+  endpointBase: string,
+  token: string,
+  params: Record<string, string>,
+  options?: { timeoutMs?: number; retries?: number },
+): Promise<any[]> {
+  const timeoutMs = options?.timeoutMs ?? 120000;
+  const retries = options?.retries ?? 3;
+
+  const search = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) search.append(k, v);
+  const url = `${endpointBase}?${search.toString()}`;
+
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    try {
+      const res = await fetchWithTimeout(
+        url,
+        {
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+        },
+        timeoutMs,
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`Eclipse exec failed (${res.status}) ${body}`.trim());
+      }
+      const json = await res.json();
+      return Array.isArray((json as any)?.data) ? (json as any).data : [];
+    } catch (err) {
+      lastErr = err;
+      const delayMs = Math.min(4000, 1000 * 2 ** attempt) + Math.floor(Math.random() * 250);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+async function loadPersistedEclipseProviders(): Promise<ProviderSummary[] | null> {
+  try {
+    const raw = await AsyncStorage.getItem(ECLIPSE_PROVIDERS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const providers = parsed.filter((p) => p && typeof p.id === "string");
+    return providers.length > 0 ? providers : null;
+  } catch {
+    return null;
+  }
+}
+
+async function persistEclipseProviders(providers: ProviderSummary[]): Promise<void> {
+  try {
+    await AsyncStorage.setItem(ECLIPSE_PROVIDERS_CACHE_KEY, JSON.stringify(providers));
+  } catch {
+    // Non-fatal cache write failure.
+  }
+}
+
 function normalizeProviderName(first: unknown, last: unknown): string {
   return `${String(first || "").trim()} ${String(last || "").trim()}`.trim();
+}
+
+function normalizeDateString(value: unknown): string | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const direct = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (direct) return direct[1];
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
 }
 
 function getEclipseProviderKey(row: any): string | null {
@@ -250,40 +448,81 @@ function getEclipseProviderKey(row: any): string | null {
 
 export const fetchProviders = async (): Promise<ProviderSummary[]> => {
   const eclipse = getEclipseConfig();
-  if (eclipse.url && eclipse.uuid && eclipse.token) {
-    const endpoint = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
-    const params = new URLSearchParams();
-    params.append("perPage", "2000");
-    const res = await fetchWithTimeout(`${endpoint}?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${eclipse.token}` },
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`Eclipse providers failed (${res.status}) ${body}`.trim());
-    }
-    const json = await res.json();
-    const rows = json.data || [];
-    const providersMap = new Map<string, ProviderSummary>();
-    for (const row of rows) {
-      const pid = row.appointment_provider_id;
-      const providerId = getEclipseProviderKey(row);
-      if (!providerId) continue;
-      if (!providersMap.has(providerId)) {
-        const first = (row.provider_first_name || "").trim();
-        const last = (row.provider_last_name || "").trim();
-        providersMap.set(providerId, {
-          id: providerId,
-          name: `${first} ${last}`.trim() || `Provider ${pid}`,
+  if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
+    throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");
+  }
+
+  const now = Date.now();
+  if (eclipseProvidersCache && now - eclipseProvidersCache.fetchedAt < ECLIPSE_ROWS_TTL_MS) return eclipseProvidersCache.providers;
+  if (eclipseProvidersInFlight) return eclipseProvidersInFlight;
+
+  const endpointBase = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
+  const baseParams: Record<string, string> = {
+    "filters[0][name]": "source_system",
+    "filters[0][operator]": "==",
+    "filters[0][values][0]": "Eclipse",
+    "overrides[other][isDistinct]": "1",
+    "overrides[fields][0][name]": "appointment_provider_id",
+    "overrides[fields][1][name]": "provider_first_name",
+    "overrides[fields][2][name]": "provider_last_name",
+  };
+
+  eclipseProvidersInFlight = (async () => {
+    try {
+      // Manager spec: no `page` for distinct providers call.
+      // Retry same query shape with smaller perPage to reduce 504 risk.
+      let rows: EclipseProviderRow[] = [];
+      let lastErr: unknown = null;
+      for (const perPage of ["2000", "1000", "500"]) {
+        try {
+          rows = (await fetchEclipseQueryExecOnce(
+            endpointBase,
+            eclipse.token,
+            { ...baseParams, perPage },
+            { timeoutMs: 120000, retries: 3 },
+          )) as EclipseProviderRow[];
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (lastErr) throw lastErr;
+
+      const providers: ProviderSummary[] = [];
+      for (const row of rows) {
+        const first = String(row?.provider_first_name ?? "").trim();
+        const last = String(row?.provider_last_name ?? "").trim();
+        if (!first && !last) continue;
+        providers.push({
+          id: makeEclipseProviderId(first, last),
+          name: `${first} ${last}`.trim(),
           credentials: null,
           specialty: null,
           latest_score: null,
-          quality_scores: {}
+          quality_scores: {},
         });
       }
+
+      const sorted = sortByName(dedupeById(providers));
+      eclipseProvidersCache = { providers: sorted, fetchedAt: Date.now() };
+      await persistEclipseProviders(sorted);
+      return sorted;
+    } catch (networkErr) {
+      // Fallback to in-memory stale cache or persisted cache during transient 5xx.
+      if (eclipseProvidersCache?.providers?.length) return eclipseProvidersCache.providers;
+      const persisted = await loadPersistedEclipseProviders();
+      if (persisted?.length) {
+        eclipseProvidersCache = { providers: persisted, fetchedAt: Date.now() };
+        return persisted;
+      }
+      throw networkErr;
     }
-    return sortByName(dedupeById(Array.from(providersMap.values())));
-  }
-  return get<ProviderSummary[]>("/providers").then((items) => sortByName(dedupeById(items)));
+  })().finally(() => {
+    eclipseProvidersInFlight = null;
+  });
+
+  return eclipseProvidersInFlight;
 };
 
 export const fetchProvider = (id: string) =>
@@ -294,76 +533,109 @@ export const fetchProvider = (id: string) =>
 // ---------------------------------------------------------------------------
 
 export const searchPatients = async (q: string, providerId?: string): Promise<PatientSearchResult[]> => {
-  const eclipse = getEclipseConfig();
-  if (eclipse.url && eclipse.uuid && eclipse.token) {
-    try {
-      const endpoint = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
-      const params = new URLSearchParams();
-      params.append("perPage", "2000");
+  void q;
+  void providerId;
+  throw new Error("searchPatients is deprecated. Use fetchPatientsByProviderDate(providerId, appointmentDate, q).");
+};
 
-      const res = await fetchWithTimeout(`${endpoint}?${params.toString()}`, {
-        headers: { Authorization: `Bearer ${eclipse.token}` },
-      });
+function rowMatchesAppointmentDate(row: any, appointmentDate: string): boolean {
+  const targetDate = normalizeDateString(appointmentDate);
+  if (!targetDate) return true;
 
-      if (res.ok) {
-        const json = await res.json();
-        let rows = json.data || [];
-        if (providerId) {
-          if (providerId.startsWith("name:")) {
-            const selectedNameKey = providerId.slice("name:".length);
-            rows = rows.filter(
-              (row: any) =>
-                normalizeProviderName(row.provider_first_name, row.provider_last_name).toLowerCase() ===
-                selectedNameKey,
-            );
-          } else {
-            rows = rows.filter((row: any) => String(row.appointment_provider_id ?? "").trim() === providerId);
-          }
-        }
-        let results: PatientSearchResult[] = rows.map((row: any) => ({
-          id: String(row.patient_case_id || row.patient_id || Math.random()),
-          first_name: (row.first_name || "").trim(),
-          last_name: (row.last_name || "").trim(),
-          date_of_birth: row.patient_dob_at || "Unknown",
-          sex: row.sex || "Unknown",
-          mrn: String(row.patient_case_id || row.patient_id || "Unknown"),
-          practice_id: "Eclipse",
-          appointment_class: row.case_class || row.appointment_status || undefined,
-        }));
+  const candidateFields = [
+    row?.appointment_date,
+    row?.appointment_date_at,
+    row?.appointment_datetime,
+    row?.date,
+    row?.date_of_service,
+    row?.dos,
+  ];
 
-        if (q) {
-          const query = normalizeText(q);
-          results = results.filter((r) => {
-            const fullName = normalizeText(`${r.first_name} ${r.last_name}`);
-            return (
-              normalizeText(r.first_name).includes(query) ||
-              normalizeText(r.last_name).includes(query) ||
-              fullName.includes(query) ||
-              normalizeText(r.mrn).includes(query) ||
-              normalizeText(r.id).includes(query)
-            );
-          });
-        }
-        return sortByName(dedupeById(results)).slice(0, 50);
-      }
-    } catch (err) {
-      console.warn("Eclipse search patients failed, falling back.", err);
-    }
+  const normalizedCandidates = candidateFields
+    .map((field) => normalizeDateString(field))
+    .filter((value): value is string => Boolean(value));
+
+  // If Eclipse does not provide a usable date in this row,
+  // do not exclude it solely because of date filtering.
+  if (normalizedCandidates.length === 0) {
+    return true;
   }
-  
-  // For the regular backend, it might not support providerId in /patients/search natively in the same way,
-  // but we can pass it if it does. The original didn't, so we'll just pass q.
-  return get<PatientSearchResult[]>("/patients/search", { q, ...(providerId ? { provider_id: providerId } : {}) })
-    .then((items) =>
-      sortByName(
-        dedupeById(
-          items.map((item) => ({
-            ...item,
-            mrn: String(item.mrn ?? ""),
-          })),
-        ),
-      ),
+
+  return normalizedCandidates.includes(targetDate);
+}
+
+function mapEclipsePatientRows(rows: any[]): PatientSearchResult[] {
+  const mapped = rows.map((row: any) => ({
+    id: String(row.patient_case_id || row.patient_id || Math.random()),
+    first_name: (row.first_name || "").trim(),
+    last_name: (row.last_name || "").trim(),
+    date_of_birth: row.patient_dob_at || "Unknown",
+    sex: row.sex || "Unknown",
+    mrn: String(row.patient_case_id || row.patient_id || "Unknown"),
+    practice_id: "Eclipse",
+    appointment_class: row.case_class || row.appointment_status || undefined,
+    patient_case_id: String(row.patient_case_id ?? row.patient_id ?? ""),
+    appointment_id: String(row.appointment_id ?? row.appt_id ?? row.appointment_no ?? ""),
+    provider_source_id: String(row.appointment_provider_id ?? ""),
+  }));
+
+  return mapped.filter((patient) => !isLikelyNoisyPatientRow(patient));
+}
+
+export const fetchPatientsByProviderDate = async (
+  providerId: string,
+  appointmentDate: string,
+  q = "",
+): Promise<PatientSearchResult[]> => {
+  const eclipse = getEclipseConfig();
+  if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
+    throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");
+  }
+
+  const name = parseEclipseProviderId(providerId);
+  if (!name) throw new Error("Invalid provider id. Refresh providers and try again.");
+
+  const endpointBase = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
+  const params: Record<string, string> = {
+    "filters[0][name]": "source_system",
+    "filters[0][operator]": "==",
+    "filters[0][values][0]": "Eclipse",
+    "filters[1][name]": "provider_first_name",
+    "filters[1][operator]": "==",
+    "filters[1][values][0]": name.first,
+    "filters[2][name]": "provider_last_name",
+    "filters[2][operator]": "==",
+    "filters[2][values][0]": name.last,
+    "filters[3][name]": "appointment_visit_at",
+    "filters[3][operator]": ">=",
+    "filters[3][values][0]": appointmentDate,
+    "filters[4][name]": "appointment_visit_at",
+    "filters[4][operator]": "<=",
+    "filters[4][values][0]": appointmentDate,
+  };
+
+  const rows = await fetchEclipseQueryExec(endpointBase, eclipse.token, params, {
+    perPage: 2000,
+    maxPages: 20,
+    timeoutMs: 60000,
+    retries: 3,
+  });
+
+  const mapped = mapEclipsePatientRows(rows);
+  if (!q) return sortByName(dedupeById(mapped));
+
+  const query = normalizeText(q);
+  const filtered = mapped.filter((r) => {
+    const fullName = normalizeText(`${r.first_name} ${r.last_name}`);
+    return (
+      normalizeText(r.first_name).includes(query) ||
+      normalizeText(r.last_name).includes(query) ||
+      fullName.includes(query) ||
+      normalizeText(r.mrn).includes(query) ||
+      normalizeText(r.id).includes(query)
     );
+  });
+  return sortByName(dedupeById(filtered));
 };
 
 // ---------------------------------------------------------------------------
@@ -371,23 +643,45 @@ export const searchPatients = async (q: string, providerId?: string): Promise<Pa
 // ---------------------------------------------------------------------------
 
 export const createEncounter = (data: {
+  encounter_id?: string;
   provider_id: string;
   patient_id: string;
+  patient_name?: string;
   visit_type: string;
   mode: string;
+  date_of_service?: string;
+  created_at?: string;
+  audio_file?: string;
+  note_audio_file?: string | null;
+  has_gold_standard?: boolean;
 }) => post<EncounterCreateResponse>("/encounters", data);
 
 export async function resolveEncounterProviderId(
   selectedProviderId: string,
   selectedProviderName?: string | null,
 ): Promise<string> {
+  const isNameEncoded = selectedProviderId.startsWith("name:");
+  const isEclipseNameEncoded = selectedProviderId.startsWith("eclname:");
+
   // If already a pipeline/provider API id, use it directly.
-  if (!selectedProviderId.startsWith("name:")) {
+  if (!isNameEncoded && !isEclipseNameEncoded) {
     if (KNOWN_BAD_PIPELINE_PROVIDER_IDS.has(selectedProviderId)) return SAFE_PIPELINE_FALLBACK_PROVIDER_ID;
     return selectedProviderId;
   }
 
-  const selectedNorm = normalizeProviderMatch(selectedProviderName || selectedProviderId.replace(/^name:/, ""));
+  let nameFromId = selectedProviderId;
+  if (isNameEncoded) {
+    nameFromId = selectedProviderId.replace(/^name:/, "");
+  } else if (isEclipseNameEncoded) {
+    // eclname:<first>|<last>
+    const raw = selectedProviderId.slice("eclname:".length);
+    const [firstEnc, lastEnc] = raw.split("|");
+    const first = decodeURIComponent(firstEnc || "").trim();
+    const last = decodeURIComponent(lastEnc || "").trim();
+    nameFromId = `${first} ${last}`.trim();
+  }
+
+  const selectedNorm = normalizeProviderMatch(selectedProviderName || nameFromId);
   const selectedTokens = selectedNorm.split(" ").filter(Boolean);
   const slugCandidate = selectedTokens.length > 0 ? `dr_${selectedTokens.join("_")}` : "";
 
@@ -422,6 +716,8 @@ export async function uploadEncounterAudio(
   encounterId: string,
   fileUri: string,
   filename = "recording.m4a",
+  noteAudioUri?: string | null,
+  noteFilename?: string | null,
 ): Promise<UploadResponse> {
   const base = getApiUrl();
   const form = new FormData();
@@ -430,6 +726,16 @@ export async function uploadEncounterAudio(
     name: filename,
     type: "audio/m4a",
   } as unknown as Blob);
+  if (noteAudioUri) {
+    const notePart = {
+      uri: noteAudioUri,
+      name: noteFilename || "note_audio.m4a",
+      type: "audio/m4a",
+    } as unknown as Blob;
+    // Keep both field names for backend compatibility.
+    form.append("note_audio", notePart);
+    form.append("note_file", notePart);
+  }
 
   // Don't set Content-Type manually — fetch auto-adds the multipart boundary
   const { "Content-Type": _, ...headersWithoutCT } = COMMON_HEADERS;

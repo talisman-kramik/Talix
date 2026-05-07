@@ -1,25 +1,23 @@
 /**
- * Settings screen — Profile, API URL configuration + offline queue management.
+ * Settings screen — profile, connectivity, privacy, and support.
  */
 import React, { useState } from "react";
 import {
   View,
   Text,
   StyleSheet,
-  TextInput,
   TouchableOpacity,
   ScrollView,
   Alert,
   useWindowDimensions,
   ActivityIndicator,
+  Linking,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import * as WebBrowser from "expo-web-browser";
 
 import Card from "../components/Card";
-import Badge from "../components/Badge";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
-import { useSettings, DEFAULT_API_URL, getApiKey } from "../store/settings";
 import { useOfflineStore } from "../store/offline";
 import { useAuthStore } from "../store/auth";
 
@@ -31,62 +29,26 @@ const APP_SCHEME = "msauth.com.talismansolutions.talixapp";
 export default function SettingsScreen() {
   const { width } = useWindowDimensions();
   const isTablet = width >= 768;
-  const { apiUrl, setApiUrl, configured } = useSettings();
-  const { queue, remove, processQueue, isOnline, checkConnectivity } = useOfflineStore();
+  const { isOnline, checkConnectivity } = useOfflineStore();
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
-  const [urlDraft, setUrlDraft] = useState(apiUrl);
-  const [testing, setTesting] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
-  const saveUrl = () => {
-    const trimmed = urlDraft.trim().replace(/\/+$/, "");
-    if (!trimmed) {
-      Alert.alert("Invalid URL", "API URL cannot be empty.");
-      return;
-    }
-    setApiUrl(trimmed);
-    setTestResult(null);
-    Alert.alert("Saved", `API URL set to: ${trimmed}`);
-  };
-
-  const testConnection = async () => {
-    const trimmed = urlDraft.trim().replace(/\/+$/, "");
-    if (!trimmed) {
-      setTestResult({ ok: false, msg: "URL cannot be empty" });
-      return;
-    }
-    setTesting(true);
-    setTestResult(null);
+  const openExternal = async (url: string) => {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
-      const key = getApiKey();
-      const headers: Record<string, string> = { "Bypass-Tunnel-Reminder": "true" };
-      if (key) headers["Authorization"] = `Bearer ${key}`;
-      const res = await fetch(`${trimmed}/providers`, { signal: controller.signal, headers });
-      clearTimeout(timeout);
-      if (res.ok) {
-        setTestResult({ ok: true, msg: "Connected to provider-facing server" });
-      } else {
-        setTestResult({ ok: false, msg: `Server responded with ${res.status}` });
+      if (url.startsWith("mailto:")) {
+        const canOpen = await Linking.canOpenURL(url);
+        if (!canOpen) {
+          Alert.alert("Unable to open mail app", "No email app is configured on this device.");
+          return;
+        }
+        await Linking.openURL(url);
+        return;
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Connection failed";
-      setTestResult({ ok: false, msg: msg.includes("abort") ? "Connection timed out (5s)" : msg });
+      await WebBrowser.openBrowserAsync(url);
+    } catch {
+      Alert.alert("Unable to open link", "Please try again.");
     }
-    setTesting(false);
-  };
-
-  const resetToDefault = () => {
-    setUrlDraft(DEFAULT_API_URL);
-    setTestResult(null);
-  };
-
-  const retryQueue = async () => {
-    await checkConnectivity();
-    await processQueue();
   };
 
   const handleLogout = () => {
@@ -103,8 +65,8 @@ export default function SettingsScreen() {
             try {
               // Clear the Microsoft browser session so next login shows account picker
               await WebBrowser.openAuthSessionAsync(
-                `${MS_LOGOUT_URL}?post_logout_redirect_uri=${encodeURIComponent("msauth.com.talismansolutions.talix://auth")}`,
-                "msauth.com.talismansolutions.talix://auth",
+                `${MS_LOGOUT_URL}?post_logout_redirect_uri=${encodeURIComponent(`${APP_SCHEME}://auth`)}`,
+                `${APP_SCHEME}://auth`,
               );
             } catch (e) {
               // If browser logout fails, still proceed with local logout
@@ -136,7 +98,6 @@ export default function SettingsScreen() {
     >
       <Text style={styles.title}>Settings</Text>
 
-      {/* ── Profile Card ────────────────────────────────────────────── */}
       <Card>
         <View style={styles.profileRow}>
           <View style={styles.avatar}>
@@ -161,81 +122,8 @@ export default function SettingsScreen() {
         </View>
       </Card>
 
-      {/* First-launch banner */}
-      {!configured && (
-        <Card style={{ backgroundColor: "#DBEAFE", borderColor: "#3B82F6" }}>
-          <View style={styles.row}>
-            <Ionicons name="information-circle" size={18} color="#1D4ED8" />
-            <Text style={{ color: "#1D4ED8", fontSize: fontSize.sm, marginLeft: spacing.sm, flex: 1 }}>
-              Configure the provider-facing server URL below, then tap "Test Connection" to verify.
-            </Text>
-          </View>
-        </Card>
-      )}
-
-      {/* API URL */}
       <Card>
-        <Text style={styles.label}>Provider Server URL</Text>
-        <Text style={styles.hint}>
-          FastAPI base URL (provider :8000 or pipeline :8100). Must be reachable from this device — use a LAN IP or HTTPS host, not localhost on a physical phone.
-        </Text>
-        <TextInput
-          value={urlDraft}
-          onChangeText={(t) => { setUrlDraft(t); setTestResult(null); }}
-          style={styles.input}
-          placeholder="http://192.168.1.100:8000 or http://host:8100"
-          placeholderTextColor={colors.textTertiary}
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-        />
-
-        {/* Auto-detected default hint */}
-        {!configured && DEFAULT_API_URL !== "http://localhost:8000" && (
-          <Text style={[styles.hint, { color: colors.brand }]}>
-            Auto-detected: {DEFAULT_API_URL}
-          </Text>
-        )}
-
-        {/* Test result */}
-        {testResult && (
-          <View style={[styles.row, { marginTop: spacing.sm }]}>
-            <Ionicons
-              name={testResult.ok ? "checkmark-circle" : "close-circle"}
-              size={16}
-              color={testResult.ok ? colors.success : colors.error}
-            />
-            <Text style={{
-              fontSize: fontSize.xs,
-              color: testResult.ok ? colors.success : colors.error,
-              marginLeft: spacing.xs,
-              flex: 1,
-            }}>
-              {testResult.msg}
-            </Text>
-          </View>
-        )}
-
-        <View style={[styles.row, { marginTop: spacing.md, gap: spacing.sm }]}>
-          <TouchableOpacity style={styles.testBtn} onPress={testConnection} disabled={testing}>
-            {testing ? (
-              <ActivityIndicator size="small" color={colors.indigo} />
-            ) : (
-              <Ionicons name="pulse" size={14} color={colors.indigo} />
-            )}
-            <Text style={styles.testBtnText}>Test Connection</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.saveBtn} onPress={saveUrl}>
-            <Text style={styles.saveBtnText}>Save</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={resetToDefault} style={{ marginLeft: "auto" }}>
-            <Text style={{ fontSize: fontSize.xs, color: colors.textTertiary }}>Reset to Default</Text>
-          </TouchableOpacity>
-        </View>
-      </Card>
-
-      {/* Connection status */}
-      <Card>
+        <Text style={styles.label}>Connectivity</Text>
         <View style={styles.row}>
           <Ionicons
             name={isOnline ? "cloud-done" : "cloud-offline"}
@@ -251,44 +139,44 @@ export default function SettingsScreen() {
         </View>
       </Card>
 
-      {/* Offline queue */}
       <Card>
-        <View style={styles.row}>
-          <Text style={styles.label}>Offline Queue</Text>
-          <Badge label={`${queue.length}`} variant={queue.length > 0 ? "warning" : "neutral"} />
-        </View>
-
-        {queue.length === 0 ? (
-          <Text style={styles.hint}>No queued recordings.</Text>
-        ) : (
-          <>
-            {queue.map((item) => (
-              <View key={item.id} style={styles.queueItem}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.queueTitle}>{item.provider_id}</Text>
-                  <Text style={styles.queueMeta}>
-                    {item.mode} · {item.visit_type} · {new Date(item.createdAt).toLocaleString()}
-                  </Text>
-                  {item.error && <Text style={styles.queueError}>{item.error}</Text>}
-                </View>
-                <Badge
-                  label={item.status}
-                  variant={item.status === "failed" ? "error" : item.status === "uploading" ? "info" : "neutral"}
-                />
-                <TouchableOpacity onPress={() => remove(item.id)} style={{ marginLeft: spacing.sm }}>
-                  <Ionicons name="trash-outline" size={18} color={colors.error} />
-                </TouchableOpacity>
-              </View>
-            ))}
-            <TouchableOpacity style={styles.retryBtn} onPress={retryQueue}>
-              <Ionicons name="cloud-upload" size={16} color={colors.textInverse} />
-              <Text style={styles.retryBtnText}>Retry All</Text>
-            </TouchableOpacity>
-          </>
-        )}
+        <Text style={styles.label}>Help</Text>
+        <Text style={styles.hint}>Need assistance with Talix? Use one of the options below.</Text>
+        <TouchableOpacity style={styles.linkRow} onPress={() => openExternal("mailto:info@talismansolutions.com")}>
+          <View style={styles.linkRowLeft}>
+            <Ionicons name="mail-outline" size={16} color={colors.textSecondary} />
+            <Text style={styles.linkRowText}>Contact Support</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.linkRow} onPress={() => openExternal("https://talismansolutions.com")}>
+          <View style={styles.linkRowLeft}>
+            <Ionicons name="globe-outline" size={16} color={colors.textSecondary} />
+            <Text style={styles.linkRowText}>Visit Website</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
+        </TouchableOpacity>
       </Card>
 
-      {/* About */}
+      <Card>
+        <Text style={styles.label}>Privacy</Text>
+        <View style={styles.privacyBulletRow}>
+          <Ionicons name="lock-closed-outline" size={14} color={colors.textSecondary} />
+          <Text style={styles.privacyText}>Audio and notes stay on your configured infrastructure.</Text>
+        </View>
+        <View style={styles.privacyBulletRow}>
+          <Ionicons name="shield-checkmark-outline" size={14} color={colors.textSecondary} />
+          <Text style={styles.privacyText}>Talix is built for HIPAA-compliant workflows.</Text>
+        </View>
+        <TouchableOpacity style={styles.linkRow} onPress={() => openExternal("https://talismansolutions.com/privacy-policy/")}>
+          <View style={styles.linkRowLeft}>
+            <Ionicons name="document-text-outline" size={16} color={colors.textSecondary} />
+            <Text style={styles.linkRowText}>Privacy Policy</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={16} color={colors.textTertiary} />
+        </TouchableOpacity>
+      </Card>
+
       <Card>
         <Text style={styles.label}>About</Text>
         <Text style={styles.hint}>Talix v1.0.0</Text>
@@ -298,7 +186,6 @@ export default function SettingsScreen() {
         </Text>
       </Card>
 
-      {/* Account — Log Out */}
       <Card style={{ marginTop: spacing.md, marginBottom: spacing.xl }}>
         <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout} disabled={loggingOut}>
           {loggingOut ? (
@@ -323,17 +210,6 @@ const styles = StyleSheet.create({
   label: { fontSize: fontSize.sm, fontWeight: "600", color: colors.text },
   hint: { fontSize: fontSize.xs, color: colors.textSecondary, marginTop: spacing.xs },
   row: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
-  input: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    fontSize: fontSize.sm,
-    color: colors.text,
-    marginTop: spacing.md,
-  },
-  // ── Profile styles ──────────────────────────────────────────────────
   profileRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -381,47 +257,39 @@ const styles = StyleSheet.create({
     color: colors.brand,
     fontWeight: "600",
   },
-  // ── Buttons ─────────────────────────────────────────────────────────
-  saveBtn: {
-    backgroundColor: colors.brand,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.lg,
+  statusText: { fontSize: fontSize.sm, fontWeight: "600", marginLeft: spacing.sm },
+  linkRow: {
+    marginTop: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
     borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
-  saveBtnText: { color: colors.textInverse, fontWeight: "600", fontSize: fontSize.sm },
-  testBtn: {
+  linkRowLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  linkRowText: {
+    fontSize: fontSize.sm,
+    color: colors.text,
+    fontWeight: "500",
+  },
+  privacyBulletRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.xs,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    borderColor: colors.indigo,
+    marginTop: spacing.sm,
   },
-  testBtnText: { color: colors.indigo, fontWeight: "600", fontSize: fontSize.sm },
-  statusText: { fontSize: fontSize.sm, fontWeight: "600", marginLeft: spacing.sm },
-  queueItem: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingVertical: spacing.sm,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.borderLight,
+  privacyText: {
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+    flex: 1,
   },
-  queueTitle: { fontSize: fontSize.sm, fontWeight: "600", color: colors.text },
-  queueMeta: { fontSize: fontSize.xs, color: colors.textSecondary },
-  queueError: { fontSize: fontSize.xs, color: colors.error, marginTop: 2 },
-  retryBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.brand,
-    paddingVertical: spacing.sm,
-    borderRadius: radius.md,
-    marginTop: spacing.md,
-    gap: spacing.sm,
-  },
-  retryBtnText: { color: colors.textInverse, fontWeight: "600", fontSize: fontSize.sm },
   logoutBtn: {
     flexDirection: "row",
     alignItems: "center",

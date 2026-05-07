@@ -39,11 +39,18 @@ function formatEncounterTitle(sampleId: string): string {
   return sampleId;
 }
 
+function getDateFromSampleId(sampleId: string): string {
+  const match = sampleId.match(/\d{4}-\d{2}-\d{2}/);
+  if (!match) return "N/A";
+  const [y, m, d] = match[0].split("-");
+  return `${Number(m)}/${Number(d)}/${y}`;
+}
+
 export default function EncountersScreen() {
   const nav = useNavigation<any>();
   const { width } = useWindowDimensions();
   const isTablet = width >= 768;
-  const numColumns = isTablet ? 2 : 1;
+  const numColumns = 1;
   const apiUrl = useSettings((s) => s.apiUrl);
 
   const [samples, setSamples] = useState<SampleSummary[]>([]);
@@ -57,9 +64,21 @@ export default function EncountersScreen() {
   const loadData = useCallback(async () => {
     setIsLoading(true);
     try {
-      const [s, p] = await Promise.all([fetchSamples(), fetchProviders()]);
-      setSamples(s);
-      setProviders(p);
+      const [samplesRes, providersRes] = await Promise.allSettled([fetchSamples(), fetchProviders()]);
+
+      if (samplesRes.status === "fulfilled") {
+        setSamples(samplesRes.value);
+      } else {
+        console.warn("Failed to load encounters", samplesRes.reason);
+        setSamples([]);
+      }
+
+      if (providersRes.status === "fulfilled") {
+        setProviders(providersRes.value);
+      } else {
+        console.warn("Failed to load providers for encounter filters", providersRes.reason);
+        setProviders([]);
+      }
     } catch (err) {
       console.warn("Failed to load encounters data", err);
     } finally {
@@ -115,6 +134,7 @@ export default function EncountersScreen() {
   const renderItem = ({ item }: { item: SampleSummary }) => {
     const score = item.quality?.overall;
     const encounterTitle = formatEncounterTitle(item.sample_id);
+    const dos = getDateFromSampleId(item.sample_id);
     return (
       <TouchableOpacity
         style={[styles.card, isTablet && styles.tabletCard]}
@@ -131,7 +151,24 @@ export default function EncountersScreen() {
           )}
         </View>
 
-        <Text style={styles.physician} numberOfLines={1}>{item.physician}</Text>
+        <View style={styles.detailGrid}>
+          <Text style={styles.detailLine}>
+            <Text style={styles.detailLabel}>Date: </Text>
+            {dos}
+          </Text>
+          <Text style={styles.detailLine} numberOfLines={1}>
+            <Text style={styles.detailLabel}>Provider: </Text>
+            {item.physician || "N/A"}
+          </Text>
+          <Text style={styles.detailLine}>
+            <Text style={styles.detailLabel}>Mode: </Text>
+            {item.mode === "ambient" ? "Conversation" : "Dictation"}
+          </Text>
+          <Text style={styles.detailLine} numberOfLines={1}>
+            <Text style={styles.detailLabel}>Encounter ID: </Text>
+            {item.sample_id}
+          </Text>
+        </View>
 
         <View style={styles.cardFooter}>
           <Badge label={item.mode} variant={item.mode === "dictation" ? "info" : "success"} />
@@ -178,7 +215,7 @@ export default function EncountersScreen() {
             <Text style={[styles.modeChipText, filterMode === null && styles.modeChipTextActive]}>All</Text>
           </TouchableOpacity>
           <ModeChip label="Dictation" value="dictation" />
-          <ModeChip label="Ambient" value="ambient" />
+          <ModeChip label="Conversation" value="ambient" />
         </View>
       </View>
 
@@ -379,7 +416,7 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     gap: spacing.xs,
   },
-  tabletCard: { marginHorizontal: spacing.xs },
+  tabletCard: { marginHorizontal: 0 },
   cardHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -392,7 +429,18 @@ const styles = StyleSheet.create({
     marginRight: spacing.sm,
   },
   sampleId: { fontSize: fontSize.sm, fontWeight: "700", color: colors.text, flex: 1 },
-  physician: { fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 },
+  detailGrid: {
+    marginTop: spacing.xs,
+    gap: 2,
+  },
+  detailLine: {
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+  },
+  detailLabel: {
+    color: colors.text,
+    fontWeight: "600",
+  },
   cardFooter: {
     flexDirection: "row",
     alignItems: "center",
