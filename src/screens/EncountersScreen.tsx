@@ -16,7 +16,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { useNavigation } from "@react-navigation/native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 
 import Badge from "../components/Badge";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
@@ -89,6 +89,12 @@ export default function EncountersScreen() {
   useEffect(() => {
     loadData();
   }, [loadData, apiUrl]);
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadData();
+    }, [loadData]),
+  );
 
   const onRefresh = async () => {
     setRefreshing(true);

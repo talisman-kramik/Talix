@@ -175,6 +175,8 @@ export default function RecordScreen() {
   const asrReadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const asrReadOffsetRef = useRef(0);
   const asrChunksSentRef = useRef(0);
+  const asrPcmHeaderSkippedRef = useRef(false);
+  const liveAsrFormatRef = useRef<"pcm" | "none">("pcm");
 
   // Pipeline
   const [stage, setStage] = useState<PipelineStage>("idle");
@@ -291,22 +293,86 @@ export default function RecordScreen() {
   // ---- Recording ----
   const startRecording = async () => {
     try {
-      const perm = await Audio.requestPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert("Permission required", "Microphone access is needed to record audio.");
-        return;
+      const existingPerm = await Audio.getPermissionsAsync();
+      let justGrantedNow = false;
+      if (!existingPerm.granted) {
+        const perm = await Audio.requestPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("Permission required", "Microphone access is needed to record audio.");
+          return;
+        }
+        justGrantedNow = true;
       }
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-      const { recording: rec } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-      );
+
+      // On first allow, iOS can briefly report permission granted but audio
+      // session is not yet fully ready for recorder creation.
+      if (justGrantedNow) {
+        await new Promise((resolve) => setTimeout(resolve, 450));
+      }
+
+      const configureRecordingMode = async () => {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+      };
+
+      await configureRecordingMode();
+      const liveRecordingOptions: Audio.RecordingOptions = {
+        isMeteringEnabled: true,
+        ios: {
+          extension: ".wav",
+          outputFormat: Audio.IOSOutputFormat.LINEARPCM,
+          audioQuality: Audio.IOSAudioQuality.MAX,
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          bitRate: 256000,
+          linearPCMBitDepth: 16,
+          linearPCMIsBigEndian: false,
+          linearPCMIsFloat: false,
+        },
+        android: {
+          extension: ".wav",
+          outputFormat: Audio.AndroidOutputFormat.DEFAULT,
+          audioEncoder: Audio.AndroidAudioEncoder.DEFAULT,
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          bitRate: 128000,
+        },
+        web: {},
+      };
+      let rec: Audio.Recording | null = null;
+      try {
+        const created = await Audio.Recording.createAsync(liveRecordingOptions);
+        rec = created.recording;
+        liveAsrFormatRef.current = "pcm";
+      } catch {
+        try {
+          // Retry after resetting mode; first permission grant can race.
+          await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+          await new Promise((resolve) => setTimeout(resolve, 180));
+          await configureRecordingMode();
+          const createdRetry = await Audio.Recording.createAsync(liveRecordingOptions);
+          rec = createdRetry.recording;
+          liveAsrFormatRef.current = "pcm";
+        } catch {
+          // Fallback to stable preset so recording still works.
+          await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          await configureRecordingMode();
+          const fallback = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+          rec = fallback.recording;
+          liveAsrFormatRef.current = "none";
+        }
+      }
+
+      if (!rec) {
+        throw new Error("Failed to initialize recording");
+      }
       setRecording(rec);
       setRecordingUri(null);
       setDuration(0);
-      setAudioFilename("recording.m4a");
+      setAudioFilename(liveAsrFormatRef.current === "pcm" ? "recording.wav" : "recording.m4a");
       setAsrPartialText("");
       setAsrFinalSegments([]);
       setAsrError(null);
@@ -314,7 +380,11 @@ export default function RecordScreen() {
       setStage("recording");
       timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
       const recUri = rec.getURI();
-      if (recUri) startLiveTranscription(recUri, mode);
+      if (recUri && liveAsrFormatRef.current === "pcm") {
+        startLiveTranscription(recUri, mode);
+      } else if (liveAsrFormatRef.current !== "pcm") {
+        setAsrError("Live transcription unavailable for this recording. Try recording again.");
+      }
     } catch (err) {
       Alert.alert("Error", "Could not start recording.");
     }
@@ -331,7 +401,8 @@ export default function RecordScreen() {
     await stopLiveTranscription();
     const uri = recording.getURI();
     setRecordingUri(uri);
-    setAudioFilename("recording.m4a");
+    if (uri?.toLowerCase().endsWith(".wav")) setAudioFilename("recording.wav");
+    else setAudioFilename("recording.m4a");
     setRecording(null);
     setStage("idle");
   };
@@ -452,7 +523,14 @@ export default function RecordScreen() {
     const asrId = `live_${Date.now()}`;
     const key = getApiKey();
     const wsMode = currentMode === "ambient" ? "ambient" : "dictation";
-    const wsUrl = `${wsBase}/ws/asr/${asrId}?mode=${encodeURIComponent(wsMode)}&format=webm${key ? `&token=${encodeURIComponent(key)}` : ""}`;
+    const wsFormat = "pcm";
+    const providerForAsr =
+      String(selectedPatient?.provider_source_id || "").trim() ||
+      String(providerId || "").replace(/^name:/, "").trim();
+    const wsUrl =
+      `${wsBase}/ws/asr/${asrId}?mode=${encodeURIComponent(wsMode)}&format=${encodeURIComponent(wsFormat)}` +
+      `${key ? `&token=${encodeURIComponent(key)}` : ""}` +
+      `${providerForAsr ? `&provider_id=${encodeURIComponent(providerForAsr)}` : ""}`;
 
     try {
       const ws = new WebSocket(wsUrl);
@@ -461,6 +539,7 @@ export default function RecordScreen() {
         setAsrStreaming(true);
         asrReadOffsetRef.current = 0;
         asrChunksSentRef.current = 0;
+        asrPcmHeaderSkippedRef.current = false;
         setAsrError(null);
         setAsrStatus("Connected. Listening...");
         fetch(`${base}/asr/preload?mode=${encodeURIComponent(wsMode)}`, {
@@ -480,7 +559,14 @@ export default function RecordScreen() {
               length: size - offset,
             } as any);
             if (!b64) return;
-            const bytes = base64ToUint8Array(b64);
+            let bytes = base64ToUint8Array(b64);
+            if (!asrPcmHeaderSkippedRef.current) {
+              // WAV carries a 44-byte header; ASR format=pcm expects raw s16le data.
+              const skip = Math.max(0, 44 - offset);
+              if (skip >= bytes.byteLength) return;
+              bytes = bytes.slice(skip);
+              asrPcmHeaderSkippedRef.current = true;
+            }
             if (bytes.byteLength > 0 && asrWsRef.current?.readyState === WebSocket.OPEN) {
               const payload = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
               asrWsRef.current.send(payload);
@@ -502,14 +588,29 @@ export default function RecordScreen() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(String(event.data));
-          const partial = String(data.partial || data.text || "").trim();
+          const eventType = String(data.type || "").toLowerCase();
+          const text = String(data.text || "").trim();
+          const partial = String(data.partial || "").trim();
           const final = String(data.final || data.segment || data.transcript || "").trim();
-          if (final) {
-            setAsrFinalSegments((prev) => [...prev, final]);
+          const finalText = final || (eventType === "final" ? text : "");
+          const partialText = partial || (eventType === "partial" ? text : "");
+
+          if (eventType === "complete") {
+            const completeText = String(data.transcript || text || "").trim();
+            if (completeText) {
+              setAsrFinalSegments((prev) => [...prev, completeText]);
+            }
+            setAsrPartialText("");
+            setAsrStatus("Transcription complete.");
+            return;
+          }
+
+          if (finalText) {
+            setAsrFinalSegments((prev) => [...prev, finalText]);
             setAsrPartialText("");
             setAsrStatus("Receiving transcript...");
-          } else if (partial) {
-            setAsrPartialText(partial);
+          } else if (partialText || text) {
+            setAsrPartialText(partialText || text);
             setAsrStatus("Receiving transcript...");
           }
         } catch {
@@ -538,6 +639,7 @@ export default function RecordScreen() {
       } catch {}
     }
     asrWsRef.current = null;
+    asrPcmHeaderSkippedRef.current = false;
     setAsrStreaming(false);
     setAsrStatus("");
   };
@@ -759,6 +861,9 @@ export default function RecordScreen() {
     setStatusMsg("");
     setProgress(0);
     setResultSampleId(null);
+    setMode("dictation");
+    setSelectedPatient(null);
+    setPatientQuery("");
     discardRecording();
     wsRef.current?.close();
   };
