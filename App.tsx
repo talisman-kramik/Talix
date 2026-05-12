@@ -28,6 +28,7 @@ import { colors, fontSize, spacing } from "./src/lib/theme";
 import { useSettings } from "./src/store/settings";
 import { useOfflineStore } from "./src/store/offline";
 import { useAuthStore } from "./src/store/auth";
+import { useProviders } from "./src/store/providers";
 
 const EncounterStack = createNativeStackNavigator();
 
@@ -42,12 +43,12 @@ function EncountersStackScreen() {
       <EncounterStack.Screen
         name="EncountersList"
         component={EncountersScreen}
-        options={{ title: "Encounters" }}
+        options={{ title: "SOAP Notes" }}
       />
       <EncounterStack.Screen
         name="EncounterDetail"
         component={EncounterDetailScreen}
-        options={{ title: "Encounter" }}
+        options={{ title: "SOAP Note" }}
       />
     </EncounterStack.Navigator>
   );
@@ -135,6 +136,15 @@ export default function App() {
     }
   }, [isAuthenticated, isRestoredSession]);
 
+  // Pre-warm the providers list as soon as the user is authenticated, so the
+  // Record / SOAP Notes screens don't pay the 6-9s Eclipse round-trip on their
+  // first mount. Runs both for fresh logins and restored sessions. Failures
+  // are swallowed — each screen still surfaces its own error UI.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    useProviders.getState().loadProviders().catch(() => {});
+  }, [isAuthenticated]);
+
   // ── Loading splash ────────────────────────────────────────────────────
   if (!loadedSettings || loadingAuth) {
     return (
@@ -189,7 +199,7 @@ export default function App() {
         <Tab.Screen
           name="Encounters"
           component={EncountersStackScreen}
-          options={{ headerShown: false }}
+          options={{ headerShown: false, tabBarLabel: "SOAP Notes" }}
         />
         <Tab.Screen name="Settings" component={SettingsScreen} />
       </Tab.Navigator>

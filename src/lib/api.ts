@@ -77,6 +77,12 @@ export interface PatientSearchResult {
   patient_case_id?: string;
   appointment_id?: string;
   provider_source_id?: string;
+  /** Real office / location name from Eclipse (e.g. "West Philadelphia"). */
+  location?: string;
+  /** Raw appointment date/time string from Eclipse (e.g. "2026-05-12T10:30:00Z"
+   *  or "2026-05-12 10:30:00"). Used for time-based auto-selection on the
+   *  Record screen. May be a date-only or a full ISO datetime. */
+  appointment_at?: string;
 }
 
 function isLikelyNoisyPatientRow(patient: PatientSearchResult): boolean {
@@ -282,7 +288,10 @@ type EclipseProviderRow = {
   provider_last_name?: string;
 };
 
-const ECLIPSE_ROWS_TTL_MS = 2 * 60 * 1000; // 2 minutes
+// Provider list changes infrequently (new providers added at human speed,
+// not minute-by-minute). 15 minutes keeps the dropdown snappy across screen
+// changes without serving stale data for long.
+const ECLIPSE_ROWS_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const ECLIPSE_PROVIDERS_CACHE_KEY = "talix.eclipse.providers.v1";
 let eclipseProvidersCache:
   | {
@@ -565,19 +574,40 @@ function rowMatchesAppointmentDate(row: any, appointmentDate: string): boolean {
 }
 
 function mapEclipsePatientRows(rows: any[]): PatientSearchResult[] {
-  const mapped = rows.map((row: any) => ({
-    id: String(row.patient_case_id || row.patient_id || Math.random()),
-    first_name: (row.first_name || "").trim(),
-    last_name: (row.last_name || "").trim(),
-    date_of_birth: row.patient_dob_at || "Unknown",
-    sex: row.sex || "Unknown",
-    mrn: String(row.patient_case_id || row.patient_id || "Unknown"),
-    practice_id: "Eclipse",
-    appointment_class: row.case_class || row.appointment_status || undefined,
-    patient_case_id: String(row.patient_case_id ?? row.patient_id ?? ""),
-    appointment_id: String(row.appointment_id ?? row.appt_id ?? row.appointment_no ?? ""),
-    provider_source_id: String(row.appointment_provider_id ?? ""),
-  }));
+  const mapped = rows.map((row: any) => {
+    // Eclipse strings often come padded with whitespace.
+    const rawLocation = String(row.location ?? "").trim();
+    const rawCostCenter = String(row.cost_center_name ?? "").trim();
+    const location = rawLocation || rawCostCenter || undefined;
+
+    // Eclipse exposes the scheduled time under several aliases depending on
+    // the underlying query view. Pick whichever is populated.
+    const appointmentAtRaw =
+      row.appointment_visit_at ||
+      row.appointment_datetime ||
+      row.appointment_date_at ||
+      row.appointment_time ||
+      undefined;
+    const appointment_at = appointmentAtRaw
+      ? String(appointmentAtRaw).trim() || undefined
+      : undefined;
+
+    return {
+      id: String(row.patient_case_id || row.patient_id || Math.random()),
+      first_name: (row.first_name || "").trim(),
+      last_name: (row.last_name || "").trim(),
+      date_of_birth: row.patient_dob_at || "Unknown",
+      sex: row.sex || "Unknown",
+      mrn: String(row.patient_case_id || row.patient_id || "Unknown"),
+      practice_id: "Eclipse",
+      appointment_class: row.case_class || row.appointment_status || undefined,
+      patient_case_id: String(row.patient_case_id ?? row.patient_id ?? ""),
+      appointment_id: String(row.appointment_id ?? row.appt_id ?? row.appointment_no ?? ""),
+      provider_source_id: String(row.appointment_provider_id ?? ""),
+      location,
+      appointment_at,
+    };
+  });
 
   return mapped.filter((patient) => !isLikelyNoisyPatientRow(patient));
 }

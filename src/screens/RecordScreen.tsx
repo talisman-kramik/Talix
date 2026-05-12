@@ -2,7 +2,7 @@
  * Record screen — audio capture with provider/patient/visit-type selection.
  * Mirrors the web Capture page. Supports offline queueing.
  */
-import React, { useEffect, useState, useRef, useCallback } from "react";
+import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import {
   View,
   Text,
@@ -27,7 +27,6 @@ import Card from "../components/Card";
 import ProgressBar from "../components/ProgressBar";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import {
-  fetchProviders,
   fetchPatientsByProviderDate,
   createEncounter,
   resolveEncounterProviderId,
@@ -38,6 +37,9 @@ import {
 } from "../lib/api";
 import { useSettings, getApiKey, getApiUrl } from "../store/settings";
 import { useOfflineStore } from "../store/offline";
+import { useAuthStore } from "../store/auth";
+import { useProviders } from "../store/providers";
+import { formatDateUS } from "../lib/date";
 
 const FRONTEND_PARITY_VISIT_TYPE = "follow_up";
 
@@ -80,13 +82,7 @@ function formatIsoDate(date: Date): string {
 }
 
 function formatDateForDisplay(isoDate: string): string {
-  const value = String(isoDate || "").trim();
-  const [yearStr, monthStr, dayStr] = value.split("-");
-  const year = Number(yearStr);
-  const month = Number(monthStr);
-  const day = Number(dayStr);
-  if (!year || !month || !day) return value || "N/A";
-  return `${month}/${day}/${year}`;
+  return formatDateUS(isoDate);
 }
 
 function normalizeEncounterIdPart(value: unknown): string {
@@ -115,6 +111,170 @@ function makeClientEncounterId(params: {
   return `${patientCasePart}_${appointmentPart}_${providerPart}_${datePart}`;
 }
 
+// ---------------------------------------------------------------------------
+// US Eastern timezone helpers — used to auto-select today's current patient
+// based on appointment time.
+// ---------------------------------------------------------------------------
+
+const ET_TIMEZONE = "America/New_York";
+
+// How close (in minutes) an appointment must be to "now ET" before we auto-
+// select it. Covers an ongoing visit running long and the next one starting
+// soon, without jumping to unrelated morning/afternoon slots.
+const APPOINTMENT_MATCH_WINDOW_MINUTES = 90;
+
+function getEtDateIso(): string {
+  // en-CA gives YYYY-MM-DD; the Intl polyfill on RN handles America/New_York.
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: ET_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+function getEtMinutesNow(): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
+  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
+  return hour * 60 + minute;
+}
+
+function etMinutesFromUtcDate(d: Date): number | null {
+  if (Number.isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
+  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  return hour * 60 + minute;
+}
+
+// Convert an Eclipse appointment timestamp to ET minutes-since-midnight.
+// Handles both timezone-aware (ISO with Z or ±HH:MM) and naive strings,
+// where naive values are assumed to already be wall-clock ET.
+function appointmentTimeToEtMinutes(value: unknown): number | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  if (/Z$|[+-]\d{2}:?\d{2}$/.test(raw)) {
+    return etMinutesFromUtcDate(new Date(raw));
+  }
+
+  const match = raw.match(/(\d{1,2}):(\d{2})/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour > 23 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+// Pick the patient whose appointment is closest to `nowMinutes`, within the
+// configured window. Returns null when no candidate qualifies.
+function findClosestAppointment(
+  patients: PatientSearchResult[],
+  nowMinutes: number,
+): PatientSearchResult | null {
+  let best: PatientSearchResult | null = null;
+  let bestDelta = Number.POSITIVE_INFINITY;
+
+  for (const p of patients) {
+    const apptMinutes = appointmentTimeToEtMinutes(p.appointment_at);
+    if (apptMinutes === null) continue;
+    const delta = Math.abs(apptMinutes - nowMinutes);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      best = p;
+    }
+  }
+
+  if (!best || bestDelta > APPOINTMENT_MATCH_WINDOW_MINUTES) return null;
+  return best;
+}
+
+// Tokenize a person's name for fuzzy matching: lowercase, strip honorifics
+// and credentials, drop punctuation, return word tokens.
+function tokensFromName(value: unknown): string[] {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/^(dr|mr|mrs|ms|miss|prof)\.?\s+/i, "")
+    .replace(/,\s*/g, " ")
+    .replace(/\b(md|do|phd|rn|np|pa|dds|dmd|esq|jr|sr|ii|iii|iv)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+// Match the logged-in user against the provider list. Returns provider id
+// when there is a single confident match; otherwise null (caller leaves
+// selection empty so the user picks manually).
+function findProviderForUser(
+  providers: ProviderSummary[],
+  user: { name?: string | null; email?: string | null } | null | undefined,
+): string | null {
+  if (!user || providers.length === 0) return null;
+
+  // Handle "Last, First" by swapping order before tokenization.
+  const rawName = String(user.name ?? "").trim();
+  const swappedName = rawName.includes(",")
+    ? rawName
+        .split(",")
+        .map((s) => s.trim())
+        .reverse()
+        .join(" ")
+    : rawName;
+  const userTokens = tokensFromName(swappedName);
+
+  // 1. Exact match on joined normalized tokens.
+  if (userTokens.length > 0) {
+    const userJoined = userTokens.join(" ");
+    const exact = providers.find(
+      (p) => tokensFromName(p.name ?? p.id).join(" ") === userJoined,
+    );
+    if (exact) return exact.id;
+  }
+
+  // Token-subset matcher: every query token must be present in the provider's
+  // tokens. Requires at least 2 tokens to avoid false positives from a single
+  // common last name.
+  const subsetMatches = (queryTokens: string[]): ProviderSummary[] => {
+    if (queryTokens.length < 2) return [];
+    return providers.filter((p) => {
+      const set = new Set(tokensFromName(p.name ?? p.id));
+      return queryTokens.every((t) => set.has(t));
+    });
+  };
+
+  // 2. Subset match on display name (handles middle names/initials).
+  const nameMatches = subsetMatches(userTokens);
+  if (nameMatches.length === 1) return nameMatches[0].id;
+  if (nameMatches.length > 1) return null; // ambiguous → no selection
+
+  // 3. Fallback: email local-part tokens (e.g. caleb.ademiloye@…).
+  const email = String(user.email ?? "").trim().toLowerCase();
+  const localPart = email.includes("@") ? email.split("@")[0] : email;
+  const emailTokens = localPart
+    .replace(/[._\-+0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+  const emailMatches = subsetMatches(emailTokens);
+  if (emailMatches.length === 1) return emailMatches[0].id;
+
+  return null;
+}
+
 function base64ToUint8Array(base64: string): Uint8Array {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const clean = String(base64 || "").replace(/=+$/, "");
@@ -139,21 +299,33 @@ export default function RecordScreen() {
   const { width } = useWindowDimensions();
   const isTablet = width >= 768;
 
-  // Data
-  const [providers, setProviders] = useState<ProviderSummary[]>([]);
-  const [providersLoaded, setProvidersLoaded] = useState(false);
+  // Data — providers come from the shared store (pre-warmed at login).
+  const storeProviders = useProviders((s) => s.providers);
+  const providersStoreLoadedAt = useProviders((s) => s.loadedAt);
+  const providersStoreError = useProviders((s) => s.error);
+  const loadProviders = useProviders((s) => s.loadProviders);
+  const providers = useMemo(
+    () =>
+      [...storeProviders].sort((a, b) =>
+        normalize(a.name ?? a.id).localeCompare(normalize(b.name ?? b.id)),
+      ),
+    [storeProviders],
+  );
+  const providersLoaded =
+    providersStoreLoadedAt !== null || providers.length > 0 || !!providersStoreError;
+  const providerLoadError = providersStoreError;
+
   const [patients, setPatients] = useState<PatientSearchResult[]>([]);
   const [patientQuery, setPatientQuery] = useState("");
   const [appointmentDate, setAppointmentDate] = useState(getTodayDateIso());
   const [providerQuery, setProviderQuery] = useState("");
-  const [providerLoadError, setProviderLoadError] = useState<string | null>(null);
   const [patientLoadError, setPatientLoadError] = useState<string | null>(null);
   const [patientsLoading, setPatientsLoading] = useState(false);
 
   // Selections
   const [providerId, setProviderId] = useState("");
   const [selectedPatient, setSelectedPatient] = useState<PatientSearchResult | null>(null);
-  const [mode, setMode] = useState("dictation");
+  const [mode, setMode] = useState("ambient");
 
   // Recording
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
@@ -191,29 +363,35 @@ export default function RecordScreen() {
   // Re-fetch when the API URL changes (e.g. user saves cloudflare tunnel URL)
   const apiUrl = useSettings((s) => s.apiUrl);
 
-  // Load providers
+  // Logged-in user, used to auto-select their matching provider entry.
+  const authUser = useAuthStore((s) => s.user);
+  const authUserName = authUser?.name ?? null;
+  const authUserEmail = authUser?.email ?? null;
+
+  // Ensure providers are loaded. The store's loadProviders is idempotent —
+  // it short-circuits when a fresh result is already in memory (pre-warmed
+  // at login). This call typically completes in <1ms after sign-in.
   useEffect(() => {
-    setProviderLoadError(null);
-    setProvidersLoaded(false);
-    fetchProviders()
-      .then((ps) => {
-        const sortedProviders = [...ps].sort((a, b) =>
-          normalize(a.name ?? a.id).localeCompare(normalize(b.name ?? b.id)),
-        );
-        setProviders(sortedProviders);
-        if (sortedProviders.length > 0) {
-          const currentExists = sortedProviders.some((p) => p.id === providerId);
-          if (!providerId || !currentExists) {
-            setProviderId(sortedProviders[0].id);
-          }
-        }
-        setProvidersLoaded(true);
-      })
-      .catch((err) => {
-        setProviderLoadError(err instanceof Error ? err.message : "Failed to load providers");
-        setProvidersLoaded(true);
+    loadProviders().catch(() => {});
+    // apiUrl is included so a backend swap (e.g. tunnel URL change) refetches.
+  }, [loadProviders, apiUrl]);
+
+  // Auto-select the logged-in user as provider once the list is available.
+  // Re-runs only when the provider list or signed-in user changes; we
+  // intentionally don't depend on `providerId` so we never clobber a manual
+  // pick the clinician makes after the initial auto-select.
+  useEffect(() => {
+    if (providers.length === 0) return;
+    const currentExists = providers.some((p) => p.id === providerId);
+    if (!providerId || !currentExists) {
+      const matchedId = findProviderForUser(providers, {
+        name: authUserName,
+        email: authUserEmail,
       });
-  }, [apiUrl]);
+      setProviderId(matchedId ?? "");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providers, authUserName, authUserEmail]);
 
   // Patient search — fetch once per provider/date, filter locally
   const [allPatients, setAllPatients] = useState<PatientSearchResult[]>([]);
@@ -237,6 +415,16 @@ export default function RecordScreen() {
         );
         setAllPatients(sortedList);
         setPatients(sortedList);
+
+        // Auto-select the patient whose appointment is closest to current
+        // ET time — only when viewing today's schedule. If no qualifying
+        // appointment is in range, leave selection empty for the clinician.
+        if (appointmentDate === getEtDateIso()) {
+          const best = findClosestAppointment(sortedList, getEtMinutesNow());
+          if (best) {
+            setSelectedPatient(best);
+          }
+        }
       })
       .catch((err) => {
         setPatientLoadError(err instanceof Error ? err.message : "Failed to load patients");
@@ -861,7 +1049,7 @@ export default function RecordScreen() {
     setStatusMsg("");
     setProgress(0);
     setResultSampleId(null);
-    setMode("dictation");
+    setMode("ambient");
     setSelectedPatient(null);
     setPatientQuery("");
     discardRecording();
@@ -992,7 +1180,7 @@ export default function RecordScreen() {
                 }}
               >
                 <Ionicons name="calendar-outline" size={16} color={colors.textTertiary} />
-                <Text style={styles.datePickerText}>{appointmentDate}</Text>
+                <Text style={styles.datePickerText}>{formatDateUS(appointmentDate)}</Text>
                 <Ionicons name="chevron-down" size={16} color={colors.textTertiary} />
               </TouchableOpacity>
             )}
@@ -1010,7 +1198,7 @@ export default function RecordScreen() {
                 {getPatientDisplayName(selectedPatient)}
               </Text>
               <Text style={styles.patientMeta}>
-                MRN: {selectedPatient.mrn} · DOB: {selectedPatient.date_of_birth}
+                MRN: {selectedPatient.mrn} · DOB: {formatDateUS(selectedPatient.date_of_birth)}
               </Text>
             </View>
             <TouchableOpacity onPress={() => setSelectedPatient(null)}>
@@ -1050,7 +1238,7 @@ export default function RecordScreen() {
                     {getPatientDisplayName(item)}
                   </Text>
                   <Text style={styles.patientMeta}>
-                    MRN: {item.mrn} · {item.sex} · {item.date_of_birth}
+                    MRN: {item.mrn} · {item.sex} · {formatDateUS(item.date_of_birth)}
                   </Text>
                 </TouchableOpacity>
               )}
@@ -1077,20 +1265,20 @@ export default function RecordScreen() {
             {formatDateForDisplay(appointmentDate)}
           </Text>
           <Text style={styles.detailLine}>
-            <Text style={styles.detailLabel}>Location: </Text>
-            {"Pennsylvania"}
+            <Text style={styles.detailLabel}>Patient Name: </Text>
+            {selectedPatient ? getPatientDisplayName(selectedPatient) : "Not selected"}
           </Text>
           <Text style={styles.detailLine}>
-            <Text style={styles.detailLabel}>Name: </Text>
-            {selectedPatient ? getPatientDisplayName(selectedPatient) : "Not selected"}
+            <Text style={styles.detailLabel}>Date of Birth: </Text>
+            {selectedPatient?.date_of_birth ? formatDateUS(selectedPatient.date_of_birth) : "N/A"}
           </Text>
           <Text style={styles.detailLine}>
             <Text style={styles.detailLabel}>Provider: </Text>
             {(providers.find((p) => p.id === providerId)?.name ?? providerId) || "N/A"}
           </Text>
           <Text style={styles.detailLine}>
-            <Text style={styles.detailLabel}>Date of Birth: </Text>
-            {selectedPatient?.date_of_birth || "N/A"}
+            <Text style={styles.detailLabel}>Location: </Text>
+            {selectedPatient?.location || "N/A"}
           </Text>
         </View>
 

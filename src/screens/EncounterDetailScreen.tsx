@@ -21,6 +21,7 @@ import {
   fetchNote,
   type SampleDetail,
 } from "../lib/api";
+import { formatDateUS } from "../lib/date";
 
 function toTitleCase(value: string): string {
   return value
@@ -84,7 +85,7 @@ export default function EncounterDetailScreen({ route }: any) {
       const noteRes = await fetchNote(sampleId, version);
       setNoteContent(noteRes.content);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load encounter");
+      setError(err instanceof Error ? err.message : "Failed to load SOAP note");
     }
     setLoading(false);
   };
@@ -146,7 +147,7 @@ export default function EncounterDetailScreen({ route }: any) {
           <Text style={styles.patientText}>
             {sample.patient_context.patient.name}
             {sample.patient_context.patient.date_of_birth
-              ? ` · DOB: ${sample.patient_context.patient.date_of_birth}`
+              ? ` · DOB: ${formatDateUS(sample.patient_context.patient.date_of_birth)}`
               : ""}
             {sample.patient_context.patient.sex ? ` · ${sample.patient_context.patient.sex}` : ""}
           </Text>
