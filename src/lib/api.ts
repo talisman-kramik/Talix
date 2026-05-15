@@ -100,9 +100,16 @@ function isLikelyNoisyPatientRow(patient: PatientSearchResult): boolean {
     (!dob || dob === "unknown" || dob === "n/a") &&
     (!sex || sex === "unknown" || sex === "n/a");
 
-  // Hide AMM_* rows even if names are partially present; these are
-  // operational/system entries in the Pennsylvania Eclipse feed.
-  if (hasSystemMrnPrefix) return true;
+  // AMM_* MRNs mean different things across source systems:
+  //   - Pennsylvania (Eclipse): they're operational/system rows with no
+  //     usable demographics → drop them.
+  //   - Baltimore (Micro): every real patient's patient_case_id starts
+  //     with AMM_LIVE.* and the rows have real names but null DOB/sex
+  //     → must NOT be dropped.
+  // We therefore only suppress AMM_* rows when there is also no name on
+  // them, which is the signal that distinguishes the PA system rows from
+  // real Baltimore patients.
+  if (hasSystemMrnPrefix && hasNoName) return true;
 
   return hasNoName && hasUnknownDemographics;
 }
@@ -263,43 +270,106 @@ function normalizeEclipseNamePart(value: unknown): string {
   return String(value ?? "").trim();
 }
 
-function makeEclipseProviderId(firstName: string, lastName: string): string {
-  // Encode the provider name directly into the id so we can later fetch patients
-  // without any extra server-side mapping/cache.
+/**
+ * Build a provider id we can later reverse to filter patients by.
+ *
+ * We prefer `appointment_provider_id` (a stable numeric id Eclipse + Micro
+ * both expose) over name-string matching because name fields can differ
+ * across source systems by whitespace, casing, or honorifics — and the
+ * Eclipse `==` filter is strict.
+ *
+ * Two formats:
+ *   - `eclid:<id>|<encFirst>|<encLast>`  ← preferred (numeric id present)
+ *   - `eclname:<encFirst>|<encLast>`     ← fallback when id is missing/0
+ *
+ * The name is always embedded so the UI can display it without an extra
+ * lookup, and so `resolveEncounterProviderId` can map to a pipeline slug.
+ */
+function makeEclipseProviderId(
+  firstName: string,
+  lastName: string,
+  appointmentProviderId?: unknown,
+): string {
   const first = normalizeEclipseNamePart(firstName);
   const last = normalizeEclipseNamePart(lastName);
+  const rawId = String(appointmentProviderId ?? "").trim();
+  if (rawId && rawId !== "0") {
+    return `eclid:${encodeURIComponent(rawId)}|${encodeURIComponent(first)}|${encodeURIComponent(last)}`;
+  }
   return `eclname:${encodeURIComponent(first)}|${encodeURIComponent(last)}`;
 }
 
-function parseEclipseProviderId(providerId: string): { first: string; last: string } | null {
-  if (!providerId.startsWith("eclname:")) return null;
-  const raw = providerId.slice("eclname:".length);
-  const [firstEnc, lastEnc] = raw.split("|");
-  if (!firstEnc && !lastEnc) return null;
-  return {
-    first: decodeURIComponent(firstEnc || "").trim(),
-    last: decodeURIComponent(lastEnc || "").trim(),
-  };
+function parseEclipseProviderId(
+  providerId: string,
+): { id?: string; first: string; last: string } | null {
+  if (providerId.startsWith("eclid:")) {
+    const raw = providerId.slice("eclid:".length);
+    const [idEnc, firstEnc, lastEnc] = raw.split("|");
+    const id = decodeURIComponent(idEnc || "").trim();
+    const first = decodeURIComponent(firstEnc || "").trim();
+    const last = decodeURIComponent(lastEnc || "").trim();
+    if (!id && !first && !last) return null;
+    return { id: id || undefined, first, last };
+  }
+  if (providerId.startsWith("eclname:")) {
+    const raw = providerId.slice("eclname:".length);
+    const [firstEnc, lastEnc] = raw.split("|");
+    if (!firstEnc && !lastEnc) return null;
+    return {
+      first: decodeURIComponent(firstEnc || "").trim(),
+      last: decodeURIComponent(lastEnc || "").trim(),
+    };
+  }
+  return null;
 }
 
 type EclipseProviderRow = {
   appointment_provider_id?: number | string;
   provider_first_name?: string;
   provider_last_name?: string;
+  source_system?: string;
+};
+
+/**
+ * Supported Eclipse source systems. The mobile app exposes them as
+ * human-readable "locations" to clinicians.
+ *  - pennsylvania → source_system="Eclipse" (the original PA practices)
+ *  - baltimore    → source_system="Micro"   (added 2026-05, Baltimore offices)
+ */
+export type EclipseLocation = "pennsylvania" | "baltimore";
+
+export const ECLIPSE_LOCATION_TO_SOURCE_SYSTEM: Record<EclipseLocation, string> = {
+  pennsylvania: "Eclipse",
+  baltimore: "Micro",
+};
+
+export const ECLIPSE_LOCATION_LABEL: Record<EclipseLocation, string> = {
+  pennsylvania: "Pennsylvania",
+  baltimore: "Baltimore",
 };
 
 // Provider list changes infrequently (new providers added at human speed,
 // not minute-by-minute). 15 minutes keeps the dropdown snappy across screen
 // changes without serving stale data for long.
 const ECLIPSE_ROWS_TTL_MS = 15 * 60 * 1000; // 15 minutes
-const ECLIPSE_PROVIDERS_CACHE_KEY = "talix.eclipse.providers.v1";
-let eclipseProvidersCache:
-  | {
-      providers: ProviderSummary[];
-      fetchedAt: number;
-    }
-  | null = null;
-let eclipseProvidersInFlight: Promise<ProviderSummary[]> | null = null;
+// v3: provider ids now embed `appointment_provider_id` when available so
+// patient lookups can filter by id instead of brittle name-string matching.
+const ECLIPSE_PROVIDERS_CACHE_KEY_PREFIX = "talix.eclipse.providers.v3";
+
+// Cache + in-flight tracker are keyed per location so switching between
+// Pennsylvania and Baltimore is instant (each location has its own warm cache).
+const eclipseProvidersCache: Map<
+  EclipseLocation,
+  { providers: ProviderSummary[]; fetchedAt: number }
+> = new Map();
+const eclipseProvidersInFlight: Map<
+  EclipseLocation,
+  Promise<ProviderSummary[]>
+> = new Map();
+
+function providersCacheKey(location: EclipseLocation): string {
+  return `${ECLIPSE_PROVIDERS_CACHE_KEY_PREFIX}.${location}`;
+}
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
   const controller = new AbortController();
@@ -408,9 +478,11 @@ async function fetchEclipseQueryExecOnce(
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-async function loadPersistedEclipseProviders(): Promise<ProviderSummary[] | null> {
+async function loadPersistedEclipseProviders(
+  location: EclipseLocation,
+): Promise<ProviderSummary[] | null> {
   try {
-    const raw = await AsyncStorage.getItem(ECLIPSE_PROVIDERS_CACHE_KEY);
+    const raw = await AsyncStorage.getItem(providersCacheKey(location));
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return null;
@@ -421,9 +493,12 @@ async function loadPersistedEclipseProviders(): Promise<ProviderSummary[] | null
   }
 }
 
-async function persistEclipseProviders(providers: ProviderSummary[]): Promise<void> {
+async function persistEclipseProviders(
+  location: EclipseLocation,
+  providers: ProviderSummary[],
+): Promise<void> {
   try {
-    await AsyncStorage.setItem(ECLIPSE_PROVIDERS_CACHE_KEY, JSON.stringify(providers));
+    await AsyncStorage.setItem(providersCacheKey(location), JSON.stringify(providers));
   } catch {
     // Non-fatal cache write failure.
   }
@@ -455,34 +530,41 @@ function getEclipseProviderKey(row: any): string | null {
   return rawId;
 }
 
-export const fetchProviders = async (): Promise<ProviderSummary[]> => {
+export const fetchProviders = async (
+  location: EclipseLocation = "pennsylvania",
+): Promise<ProviderSummary[]> => {
   const eclipse = getEclipseConfig();
   if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
     throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");
   }
 
+  const sourceSystem = ECLIPSE_LOCATION_TO_SOURCE_SYSTEM[location];
+
   const now = Date.now();
-  if (eclipseProvidersCache && now - eclipseProvidersCache.fetchedAt < ECLIPSE_ROWS_TTL_MS) return eclipseProvidersCache.providers;
-  if (eclipseProvidersInFlight) return eclipseProvidersInFlight;
+  const cached = eclipseProvidersCache.get(location);
+  if (cached && now - cached.fetchedAt < ECLIPSE_ROWS_TTL_MS) return cached.providers;
+  const inFlight = eclipseProvidersInFlight.get(location);
+  if (inFlight) return inFlight;
 
   const endpointBase = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
   const baseParams: Record<string, string> = {
     "filters[0][name]": "source_system",
     "filters[0][operator]": "==",
-    "filters[0][values][0]": "Eclipse",
+    "filters[0][values][0]": sourceSystem,
     "overrides[other][isDistinct]": "1",
     "overrides[fields][0][name]": "appointment_provider_id",
     "overrides[fields][1][name]": "provider_first_name",
     "overrides[fields][2][name]": "provider_last_name",
+    "overrides[fields][3][name]": "source_system",
   };
 
-  eclipseProvidersInFlight = (async () => {
+  const promise = (async () => {
     try {
       // Manager spec: no `page` for distinct providers call.
       // Retry same query shape with smaller perPage to reduce 504 risk.
       let rows: EclipseProviderRow[] = [];
       let lastErr: unknown = null;
-      for (const perPage of ["2000", "1000", "500"]) {
+      for (const perPage of ["5000", "2000", "1000", "500"]) {
         try {
           rows = (await fetchEclipseQueryExecOnce(
             endpointBase,
@@ -504,7 +586,7 @@ export const fetchProviders = async (): Promise<ProviderSummary[]> => {
         const last = String(row?.provider_last_name ?? "").trim();
         if (!first && !last) continue;
         providers.push({
-          id: makeEclipseProviderId(first, last),
+          id: makeEclipseProviderId(first, last, row?.appointment_provider_id),
           name: `${first} ${last}`.trim(),
           credentials: null,
           specialty: null,
@@ -514,24 +596,26 @@ export const fetchProviders = async (): Promise<ProviderSummary[]> => {
       }
 
       const sorted = sortByName(dedupeById(providers));
-      eclipseProvidersCache = { providers: sorted, fetchedAt: Date.now() };
-      await persistEclipseProviders(sorted);
+      eclipseProvidersCache.set(location, { providers: sorted, fetchedAt: Date.now() });
+      await persistEclipseProviders(location, sorted);
       return sorted;
     } catch (networkErr) {
       // Fallback to in-memory stale cache or persisted cache during transient 5xx.
-      if (eclipseProvidersCache?.providers?.length) return eclipseProvidersCache.providers;
-      const persisted = await loadPersistedEclipseProviders();
+      const stale = eclipseProvidersCache.get(location);
+      if (stale?.providers?.length) return stale.providers;
+      const persisted = await loadPersistedEclipseProviders(location);
       if (persisted?.length) {
-        eclipseProvidersCache = { providers: persisted, fetchedAt: Date.now() };
+        eclipseProvidersCache.set(location, { providers: persisted, fetchedAt: Date.now() });
         return persisted;
       }
       throw networkErr;
     }
   })().finally(() => {
-    eclipseProvidersInFlight = null;
+    eclipseProvidersInFlight.delete(location);
   });
 
-  return eclipseProvidersInFlight;
+  eclipseProvidersInFlight.set(location, promise);
+  return promise;
 };
 
 export const fetchProvider = (id: string) =>
@@ -616,40 +700,118 @@ export const fetchPatientsByProviderDate = async (
   providerId: string,
   appointmentDate: string,
   q = "",
+  location: EclipseLocation = "pennsylvania",
 ): Promise<PatientSearchResult[]> => {
   const eclipse = getEclipseConfig();
   if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
     throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");
   }
 
-  const name = parseEclipseProviderId(providerId);
-  if (!name) throw new Error("Invalid provider id. Refresh providers and try again.");
+  const parsed = parseEclipseProviderId(providerId);
+  if (!parsed) throw new Error("Invalid provider id. Refresh providers and try again.");
 
+  const sourceSystem = ECLIPSE_LOCATION_TO_SOURCE_SYSTEM[location];
   const endpointBase = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
-  const params: Record<string, string> = {
-    "filters[0][name]": "source_system",
-    "filters[0][operator]": "==",
-    "filters[0][values][0]": "Eclipse",
-    "filters[1][name]": "provider_first_name",
-    "filters[1][operator]": "==",
-    "filters[1][values][0]": name.first,
-    "filters[2][name]": "provider_last_name",
-    "filters[2][operator]": "==",
-    "filters[2][values][0]": name.last,
-    "filters[3][name]": "appointment_visit_at",
-    "filters[3][operator]": ">=",
-    "filters[3][values][0]": appointmentDate,
-    "filters[4][name]": "appointment_visit_at",
-    "filters[4][operator]": "<=",
-    "filters[4][values][0]": appointmentDate,
+
+  // Common date-range filters reused across all attempt shapes.
+  const dateFilters: Record<string, string> = {
+    "filters[__d0][name]": "appointment_visit_at",
+    "filters[__d0][operator]": ">=",
+    "filters[__d0][values][0]": appointmentDate,
+    "filters[__d1][name]": "appointment_visit_at",
+    "filters[__d1][operator]": "<=",
+    "filters[__d1][values][0]": appointmentDate,
   };
 
-  const rows = await fetchEclipseQueryExec(endpointBase, eclipse.token, params, {
-    perPage: 2000,
-    maxPages: 20,
-    timeoutMs: 60000,
-    retries: 3,
-  });
+  const baseSourceFilter: Record<string, string> = {
+    "filters[s0][name]": "source_system",
+    "filters[s0][operator]": "==",
+    "filters[s0][values][0]": sourceSystem,
+  };
+
+  // Strategy:
+  //   1. If we have a numeric appointment_provider_id, query the server with it.
+  //      Most reliable across both Eclipse (PA) and Micro (Baltimore).
+  //   2. If that returns zero, try the name-based filter (provider_first_name +
+  //      provider_last_name with `==`). Helps when id is null but names match.
+  //   3. If that also returns zero, drop the provider filter entirely, pull the
+  //      day's patients for the source_system, and filter client-side by
+  //      normalized provider name. This covers cases where Micro stores
+  //      provider names with different whitespace / casing / honorifics than
+  //      the distinct providers query returns.
+  const attempts: Record<string, string>[] = [];
+
+  if (parsed.id) {
+    attempts.push({
+      ...baseSourceFilter,
+      "filters[p0][name]": "appointment_provider_id",
+      "filters[p0][operator]": "==",
+      "filters[p0][values][0]": parsed.id,
+      ...dateFilters,
+    });
+  }
+  if (parsed.first || parsed.last) {
+    attempts.push({
+      ...baseSourceFilter,
+      "filters[pf][name]": "provider_first_name",
+      "filters[pf][operator]": "==",
+      "filters[pf][values][0]": parsed.first,
+      "filters[pl][name]": "provider_last_name",
+      "filters[pl][operator]": "==",
+      "filters[pl][values][0]": parsed.last,
+      ...dateFilters,
+    });
+  }
+  // Last-resort fallback used to scan + filter client-side.
+  const dateOnlyParams: Record<string, string> = {
+    ...baseSourceFilter,
+    ...dateFilters,
+  };
+
+  let rows: any[] = [];
+  for (const params of attempts) {
+    const result = await fetchEclipseQueryExec(endpointBase, eclipse.token, params, {
+      perPage: 5000,
+      maxPages: 20,
+      timeoutMs: 60000,
+      retries: 3,
+    });
+    if (result.length > 0) {
+      rows = result;
+      break;
+    }
+  }
+
+  if (rows.length === 0) {
+    // Client-side filter fallback. We pull the day's patients for this
+    // source_system, then keep rows whose provider matches the selection
+    // via id (preferred) or normalized name tokens.
+    const dayRows = await fetchEclipseQueryExec(
+      endpointBase,
+      eclipse.token,
+      dateOnlyParams,
+      { perPage: 5000, maxPages: 20, timeoutMs: 60000, retries: 3 },
+    );
+
+    const targetTokens = normalizeProviderMatch(
+      `${parsed.first} ${parsed.last}`,
+    )
+      .split(" ")
+      .filter(Boolean);
+
+    rows = dayRows.filter((row: any) => {
+      if (parsed.id) {
+        const rowId = String(row?.appointment_provider_id ?? "").trim();
+        if (rowId && rowId === parsed.id) return true;
+      }
+      const rowName = normalizeProviderMatch(
+        `${row?.provider_first_name ?? ""} ${row?.provider_last_name ?? ""}`,
+      );
+      if (!rowName || targetTokens.length === 0) return false;
+      const rowTokens = new Set(rowName.split(" ").filter(Boolean));
+      return targetTokens.every((tok) => rowTokens.has(tok));
+    });
+  }
 
   const mapped = mapEclipsePatientRows(rows);
   if (!q) return sortByName(dedupeById(mapped));
@@ -692,9 +854,10 @@ export async function resolveEncounterProviderId(
 ): Promise<string> {
   const isNameEncoded = selectedProviderId.startsWith("name:");
   const isEclipseNameEncoded = selectedProviderId.startsWith("eclname:");
+  const isEclipseIdEncoded = selectedProviderId.startsWith("eclid:");
 
   // If already a pipeline/provider API id, use it directly.
-  if (!isNameEncoded && !isEclipseNameEncoded) {
+  if (!isNameEncoded && !isEclipseNameEncoded && !isEclipseIdEncoded) {
     if (KNOWN_BAD_PIPELINE_PROVIDER_IDS.has(selectedProviderId)) return SAFE_PIPELINE_FALLBACK_PROVIDER_ID;
     return selectedProviderId;
   }
@@ -706,6 +869,13 @@ export async function resolveEncounterProviderId(
     // eclname:<first>|<last>
     const raw = selectedProviderId.slice("eclname:".length);
     const [firstEnc, lastEnc] = raw.split("|");
+    const first = decodeURIComponent(firstEnc || "").trim();
+    const last = decodeURIComponent(lastEnc || "").trim();
+    nameFromId = `${first} ${last}`.trim();
+  } else if (isEclipseIdEncoded) {
+    // eclid:<id>|<first>|<last> — name is still embedded for slug mapping.
+    const raw = selectedProviderId.slice("eclid:".length);
+    const [, firstEnc, lastEnc] = raw.split("|");
     const first = decodeURIComponent(firstEnc || "").trim();
     const last = decodeURIComponent(lastEnc || "").trim();
     nameFromId = `${first} ${last}`.trim();

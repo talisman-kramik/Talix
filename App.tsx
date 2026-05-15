@@ -138,12 +138,14 @@ export default function App() {
 
   // Pre-warm the providers list as soon as the user is authenticated, so the
   // Record / SOAP Notes screens don't pay the 6-9s Eclipse round-trip on their
-  // first mount. Runs both for fresh logins and restored sessions. Failures
-  // are swallowed — each screen still surfaces its own error UI.
+  // first mount. Re-warms on location switch (PA ↔ Baltimore) so each location
+  // has its own fresh-or-cached list ready. Failures are swallowed — each
+  // screen still surfaces its own error UI.
+  const eclipseLocation = useSettings((s) => s.eclipseLocation);
   useEffect(() => {
     if (!isAuthenticated) return;
-    useProviders.getState().loadProviders().catch(() => {});
-  }, [isAuthenticated]);
+    useProviders.getState().loadProviders(eclipseLocation).catch(() => {});
+  }, [isAuthenticated, eclipseLocation]);
 
   // ── Loading splash ────────────────────────────────────────────────────
   if (!loadedSettings || loadingAuth) {

@@ -66,6 +66,7 @@ export default function EncountersScreen() {
   const isTablet = width >= 768;
   const numColumns = 1;
   const apiUrl = useSettings((s) => s.apiUrl);
+  const eclipseLocation = useSettings((s) => s.eclipseLocation);
 
   const [samples, setSamples] = useState<SampleSummary[]>([]);
   const [filterProvider, setFilterProvider] = useState<string | null>(null);
@@ -91,10 +92,11 @@ export default function EncountersScreen() {
   const loadData = useCallback(async () => {
     if (!hasLoadedSamplesOnce.current) setIsLoading(true);
 
-    // Kick off (or no-op) a providers refresh in the background. We don't
-    // block the SOAP notes UI on it — the dropdown will hydrate from the
-    // store whenever the load resolves.
-    void loadProviders().catch(() => {});
+    // Kick off (or no-op) a providers refresh in the background for the
+    // currently selected Eclipse location. We don't block the SOAP notes UI
+    // on it — the dropdown will hydrate from the store whenever the load
+    // resolves.
+    void loadProviders(eclipseLocation).catch(() => {});
 
     try {
       const list = await fetchSamples();
@@ -110,7 +112,7 @@ export default function EncountersScreen() {
     } finally {
       setIsLoading(false);
     }
-  }, [loadProviders]);
+  }, [loadProviders, eclipseLocation]);
 
   useEffect(() => {
     loadData();

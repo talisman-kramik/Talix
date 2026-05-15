@@ -15,6 +15,7 @@ import {
   FlatList,
   TextInput,
   ActivityIndicator,
+  Modal,
 } from "react-native";
 import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system/legacy";
@@ -32,6 +33,8 @@ import {
   resolveEncounterProviderId,
   uploadEncounterAudio,
   getWsUrl,
+  ECLIPSE_LOCATION_LABEL,
+  type EclipseLocation,
   type ProviderSummary,
   type PatientSearchResult,
 } from "../lib/api";
@@ -316,6 +319,9 @@ export default function RecordScreen() {
   const providerLoadError = providersStoreError;
 
   const [patients, setPatients] = useState<PatientSearchResult[]>([]);
+  // `allPatients` holds the unfiltered list for the current provider/date so
+  // typing in the search box filters locally instead of re-hitting the API.
+  const [allPatients, setAllPatients] = useState<PatientSearchResult[]>([]);
   const [patientQuery, setPatientQuery] = useState("");
   const [appointmentDate, setAppointmentDate] = useState(getTodayDateIso());
   const [providerQuery, setProviderQuery] = useState("");
@@ -363,18 +369,44 @@ export default function RecordScreen() {
   // Re-fetch when the API URL changes (e.g. user saves cloudflare tunnel URL)
   const apiUrl = useSettings((s) => s.apiUrl);
 
+  // Selected Eclipse location (PA = "Eclipse", Baltimore = "Micro"). The store
+  // persists this across launches, so a clinician who works out of Baltimore
+  // stays in Baltimore mode without re-toggling every session.
+  const eclipseLocation = useSettings((s) => s.eclipseLocation);
+  const setEclipseLocation = useSettings((s) => s.setEclipseLocation);
+  const [locationPickerOpen, setLocationPickerOpen] = useState(false);
+
   // Logged-in user, used to auto-select their matching provider entry.
   const authUser = useAuthStore((s) => s.user);
   const authUserName = authUser?.name ?? null;
   const authUserEmail = authUser?.email ?? null;
 
-  // Ensure providers are loaded. The store's loadProviders is idempotent —
-  // it short-circuits when a fresh result is already in memory (pre-warmed
-  // at login). This call typically completes in <1ms after sign-in.
+  // Ensure providers are loaded for the active location. The store's
+  // loadProviders is idempotent — it short-circuits when a fresh result for
+  // the same location is already in memory (pre-warmed at login). Switching
+  // location triggers a refetch (which may hit the per-location cache).
   useEffect(() => {
-    loadProviders().catch(() => {});
+    loadProviders(eclipseLocation).catch(() => {});
     // apiUrl is included so a backend swap (e.g. tunnel URL change) refetches.
-  }, [loadProviders, apiUrl]);
+  }, [loadProviders, apiUrl, eclipseLocation]);
+
+  // When the user switches locations, clear any in-memory selections — the
+  // previously selected provider/patient may not exist in the new location's
+  // dataset. The auto-select effects below pick a sensible default for the
+  // new list.
+  const prevLocationRef = useRef<EclipseLocation>(eclipseLocation);
+  useEffect(() => {
+    if (prevLocationRef.current !== eclipseLocation) {
+      prevLocationRef.current = eclipseLocation;
+      setProviderId("");
+      setSelectedPatient(null);
+      setPatients([]);
+      setAllPatients([]);
+      setPatientQuery("");
+      setProviderQuery("");
+      setPatientLoadError(null);
+    }
+  }, [eclipseLocation]);
 
   // Auto-select the logged-in user as provider once the list is available.
   // Re-runs only when the provider list or signed-in user changes; we
@@ -393,9 +425,8 @@ export default function RecordScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providers, authUserName, authUserEmail]);
 
-  // Patient search — fetch once per provider/date, filter locally
-  const [allPatients, setAllPatients] = useState<PatientSearchResult[]>([]);
-
+  // Patient search — fetch once per provider/date, filter locally.
+  // (state declared above next to `patients`.)
   useEffect(() => {
     // Hit the network when provider/date changes.
     setSelectedPatient(null);
@@ -408,7 +439,7 @@ export default function RecordScreen() {
       return;
     }
     setPatientsLoading(true);
-    fetchPatientsByProviderDate(providerId, appointmentDate)
+    fetchPatientsByProviderDate(providerId, appointmentDate, "", eclipseLocation)
       .then((list) => {
         const sortedList = [...list].sort((a, b) =>
           normalize(`${a.last_name} ${a.first_name}`).localeCompare(normalize(`${b.last_name} ${b.first_name}`)),
@@ -432,7 +463,7 @@ export default function RecordScreen() {
       .finally(() => {
         setPatientsLoading(false);
       });
-  }, [providerId, appointmentDate, apiUrl]);
+  }, [providerId, appointmentDate, apiUrl, eclipseLocation]);
 
   // Local filtering when user types
   useEffect(() => {
@@ -1085,6 +1116,69 @@ export default function RecordScreen() {
         </Card>
       )}
 
+      {/* Location — selects which Eclipse source_system (Pennsylvania=Eclipse,
+          Baltimore=Micro) drives the provider + patient queries. Persisted in
+          settings so it carries across sessions. */}
+      <Card>
+        <Text style={styles.label}>Location</Text>
+        <Text style={styles.sublabel}>
+          Choose the office whose schedule you’re working from. Switching
+          locations refreshes the provider and patient lists.
+        </Text>
+        <TouchableOpacity
+          style={styles.locationDropdown}
+          onPress={() => setLocationPickerOpen(true)}
+        >
+          <Ionicons name="business-outline" size={16} color={colors.textSecondary} />
+          <Text style={styles.locationDropdownText}>
+            {ECLIPSE_LOCATION_LABEL[eclipseLocation]}
+          </Text>
+          <Ionicons name="chevron-down" size={16} color={colors.textTertiary} />
+        </TouchableOpacity>
+      </Card>
+
+      <Modal
+        visible={locationPickerOpen}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setLocationPickerOpen(false)}
+      >
+        <TouchableOpacity
+          style={styles.locationModalBackdrop}
+          activeOpacity={1}
+          onPress={() => setLocationPickerOpen(false)}
+        >
+          <View style={styles.locationModalCard}>
+            <Text style={styles.locationModalTitle}>Select Location</Text>
+            {(["pennsylvania", "baltimore"] as EclipseLocation[]).map((loc) => {
+              const active = eclipseLocation === loc;
+              return (
+                <TouchableOpacity
+                  key={loc}
+                  style={[styles.locationModalRow, active && styles.locationModalRowActive]}
+                  onPress={() => {
+                    setEclipseLocation(loc);
+                    setLocationPickerOpen(false);
+                  }}
+                >
+                  <Text
+                    style={[
+                      styles.locationModalRowText,
+                      active && styles.locationModalRowTextActive,
+                    ]}
+                  >
+                    {ECLIPSE_LOCATION_LABEL[loc]}
+                  </Text>
+                  {active ? (
+                    <Ionicons name="checkmark" size={18} color={colors.brand} />
+                  ) : null}
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
       {/* Provider */}
       <Card>
         <Text style={styles.label}>Provider</Text>
@@ -1691,6 +1785,69 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     fontWeight: "600",
     flex: 1,
+  },
+  locationDropdown: {
+    marginTop: spacing.sm,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.card,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  locationDropdownText: {
+    flex: 1,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.text,
+  },
+  locationModalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(15, 23, 42, 0.45)",
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: spacing.lg,
+  },
+  locationModalCard: {
+    width: "100%",
+    maxWidth: 360,
+    backgroundColor: colors.card,
+    borderRadius: radius.lg,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+    shadowColor: "#000",
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 6,
+  },
+  locationModalTitle: {
+    fontSize: fontSize.md,
+    fontWeight: "700",
+    color: colors.text,
+    marginBottom: spacing.sm,
+  },
+  locationModalRow: {
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radius.md,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  locationModalRowActive: {
+    backgroundColor: "#ECFDF5",
+  },
+  locationModalRowText: {
+    flex: 1,
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.text,
+  },
+  locationModalRowTextActive: {
+    color: colors.brand,
   },
   patientRow: {
     paddingVertical: spacing.sm,
