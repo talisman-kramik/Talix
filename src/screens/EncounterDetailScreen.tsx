@@ -10,7 +10,7 @@
  *   3. SOAP Note (id, mode, quality)
  *   4. Markdown body
  */
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -21,10 +21,18 @@ import {
 } from "react-native";
 import Markdown from "react-native-markdown-display";
 import { Ionicons } from "@expo/vector-icons";
+import { useFocusEffect } from "@react-navigation/native";
 
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import Badge from "../components/Badge";
-import { fetchSample, fetchNote, type SampleDetail } from "../lib/api";
+import WebStatusBanner from "../components/WebStatusBanner";
+import {
+  fetchSample,
+  fetchNote,
+  fetchWebStatus,
+  type SampleDetail,
+  type WebStatus,
+} from "../lib/api";
 import { formatDateUS } from "../lib/date";
 
 // ---------------------------------------------------------------------------
@@ -192,11 +200,39 @@ export default function EncounterDetailScreen({ route }: any) {
   const [noteContent, setNoteContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [webStatus, setWebStatus] = useState<WebStatus | null>(null);
 
   useEffect(() => {
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sampleId]);
+
+  // Non-blocking web-status fetch: fires on screen focus (mount, foreground, nav back)
+  useFocusEffect(
+    useCallback(() => {
+      let isActive = true;
+
+      const loadWebStatus = async () => {
+        try {
+          const status = await fetchWebStatus(sampleId);
+          if (isActive) {
+            setWebStatus(status);
+          }
+        } catch {
+          // Silent suppression: network error, timeout, non-200/non-404 → no banner
+          if (isActive) {
+            setWebStatus(null);
+          }
+        }
+      };
+
+      loadWebStatus();
+
+      return () => {
+        isActive = false;
+      };
+    }, [sampleId])
+  );
 
   const loadData = async () => {
     setLoading(true);
@@ -314,6 +350,10 @@ export default function EncounterDetailScreen({ route }: any) {
             </Text>
           </View>
         </View>
+
+        {/* Web-status banner (non-dismissible) */}
+        <WebStatusBanner webStatus={webStatus} />
+
         <View style={styles.metaInline}>
           <Badge
             label={modeLabel}

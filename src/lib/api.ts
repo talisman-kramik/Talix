@@ -162,6 +162,52 @@ export interface UploadResponse {
   message: string;
 }
 
+/**
+ * Demographics payload included in encounter_details.json on upload.
+ * Required for web history display and SFTP workflow.
+ */
+export interface EncounterDemographics {
+  provider_name: string;
+  patient_name: string;
+  patient_dob: string; // ISO 8601 date: YYYY-MM-DD
+  account_number: string;
+  case_name: string;
+  location_name: string;
+  system_location: string;
+}
+
+/**
+ * Validate that provider_name contains at least 1 non-whitespace character.
+ * Required for SFTP upload workflow to construct the provider folder path.
+ */
+export function validateProviderName(providerName: string): boolean {
+  return providerName.trim().length > 0;
+}
+
+/**
+ * Build the encounter_details demographics payload from available data.
+ * All fields are required in the payload; missing values default to empty string.
+ */
+export function buildEncounterDetails(params: {
+  providerName: string;
+  patientName: string;
+  patientDob: string;
+  accountNumber?: string;
+  caseName?: string;
+  locationName?: string;
+  systemLocation?: string;
+}): EncounterDemographics {
+  return {
+    provider_name: params.providerName,
+    patient_name: params.patientName,
+    patient_dob: params.patientDob,
+    account_number: params.accountNumber ?? "",
+    case_name: params.caseName ?? "",
+    location_name: params.locationName ?? "",
+    system_location: params.systemLocation ?? "",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -979,6 +1025,7 @@ export async function uploadEncounterAudio(
   filename = "recording.m4a",
   noteAudioUri?: string | null,
   noteFilename?: string | null,
+  demographics?: EncounterDemographics,
 ): Promise<UploadResponse> {
   const base = getApiUrl();
   const form = new FormData();
@@ -996,6 +1043,14 @@ export async function uploadEncounterAudio(
     // Keep both field names for backend compatibility.
     form.append("note_audio", notePart);
     form.append("note_file", notePart);
+  }
+
+  // Include demographics in encounter_details form field if provided
+  if (demographics) {
+    if (!validateProviderName(demographics.provider_name)) {
+      throw new Error("provider_name must contain at least 1 non-whitespace character");
+    }
+    form.append("encounter_details", JSON.stringify(demographics));
   }
 
   // Don't set Content-Type manually — fetch auto-adds the multipart boundary
@@ -1016,6 +1071,40 @@ export const fetchEncounterStatus = (id: string) =>
   get<{ encounter_id: string; status: string; message: string; sample_id?: string }>(
     `/encounters/${id}/status`,
   );
+
+// ---------------------------------------------------------------------------
+// Web-Status
+// ---------------------------------------------------------------------------
+
+export interface WebStatus {
+  status: string;
+  edited_at: string;
+  edited_by: string;
+  soap_version: number;
+}
+
+/**
+ * Fetch the web-status for an encounter from the Pipeline_Server.
+ * Returns null on 404 (no web edits). Throws on network error/timeout.
+ */
+export async function fetchWebStatus(id: string): Promise<WebStatus | null> {
+  const base = getApiUrl();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const res = await fetch(`${base}/encounters/${id}/web-status`, {
+      headers: { ...COMMON_HEADERS, ...getAuthHeaders() },
+      signal: controller.signal,
+    });
+
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`API ${res.status}: /encounters/${id}/web-status`);
+    return res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // WebSocket URL
