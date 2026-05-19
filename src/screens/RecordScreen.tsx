@@ -15,12 +15,14 @@ import {
   FlatList,
   TextInput,
   ActivityIndicator,
-  Modal,
+  PanResponder,
+  type LayoutChangeEvent,
 } from "react-native";
 import { Audio } from "expo-av";
 import * as FileSystem from "expo-file-system/legacy";
 import { Ionicons } from "@expo/vector-icons";
 import { useNavigation } from "@react-navigation/native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import DateTimePicker, { DateTimePickerAndroid } from "@react-native-community/datetimepicker";
 import * as DocumentPicker from "expo-document-picker";
 
@@ -297,10 +299,297 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return new Uint8Array(out);
 }
 
+// Reusable audio preview / playback card. Lets providers verify the recorded
+// or uploaded audio before submitting (item #11 in the QA feedback) by
+// providing play/pause controls, a progress indicator, and a clear
+// per-file card layout so multiple audio files (main vs. notes) read as
+// distinct items.
+type AudioPreviewCardProps = {
+  uri: string;
+  filename: string;
+  label?: string;
+  // Optional discard handler — when supplied, a small × button is rendered
+  // on the right edge of the card.
+  onDiscard?: () => void;
+};
+
+const SKIP_MS = 10_000;
+
+function AudioPreviewCard({ uri, filename, label, onDiscard }: AudioPreviewCardProps) {
+  const soundRef = useRef<Audio.Sound | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [positionMs, setPositionMs] = useState(0);
+  const [durationMs, setDurationMs] = useState(0);
+  const [loading, setLoading] = useState(false);
+
+  // Track width is measured via onLayout so we can convert a touch X coordinate
+  // into a fractional playhead position. Kept in a ref so PanResponder closures
+  // always see the latest value without re-creating the responder.
+  const trackWidthRef = useRef(0);
+  const durationMsRef = useRef(0);
+  const wasPlayingBeforeScrubRef = useRef(false);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  // Mirrors `positionMs` while the user is actively dragging, so the UI
+  // tracks the finger smoothly without waiting for the native status update.
+  const [scrubMs, setScrubMs] = useState(0);
+
+  useEffect(() => {
+    durationMsRef.current = durationMs;
+  }, [durationMs]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let local: Audio.Sound | null = null;
+
+    async function load() {
+      try {
+        setLoading(true);
+        const created = await Audio.Sound.createAsync(
+          { uri },
+          { shouldPlay: false, progressUpdateIntervalMillis: 100 },
+        );
+        if (cancelled) {
+          await created.sound.unloadAsync();
+          return;
+        }
+        local = created.sound;
+        soundRef.current = created.sound;
+        local.setOnPlaybackStatusUpdate((status) => {
+          if (!status.isLoaded) return;
+          setDurationMs(status.durationMillis ?? 0);
+          setIsPlaying(status.isPlaying ?? false);
+          if (!wasPlayingBeforeScrubRef.current && status.positionMillis != null) {
+            // While the user drags, ignore native position updates so the
+            // thumb stays under the finger instead of snapping back.
+          }
+          setPositionMs((prev) => {
+            return wasPlayingBeforeScrubRef.current ? prev : status.positionMillis ?? prev;
+          });
+          if (status.didJustFinish) {
+            local?.setPositionAsync(0).catch(() => {});
+          }
+        });
+      } catch {
+        // Source may be missing / unsupported — leave duration at 0 so the
+        // play button stays disabled.
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    load();
+    return () => {
+      cancelled = true;
+      if (local) {
+        local.unloadAsync().catch(() => {});
+      }
+      soundRef.current = null;
+      setIsPlaying(false);
+      setPositionMs(0);
+      setDurationMs(0);
+    };
+  }, [uri]);
+
+  const togglePlay = async () => {
+    const s = soundRef.current;
+    if (!s) return;
+    try {
+      if (isPlaying) {
+        await s.pauseAsync();
+      } else {
+        if (durationMs > 0 && positionMs >= durationMs - 50) {
+          await s.setPositionAsync(0);
+        }
+        await s.playAsync();
+      }
+    } catch {
+      // Ignore playback errors — UI state will recover via status updates.
+    }
+  };
+
+  const seekTo = useCallback(async (targetMs: number) => {
+    const s = soundRef.current;
+    const dur = durationMsRef.current;
+    if (!s || dur <= 0) return;
+    const clamped = Math.max(0, Math.min(dur, targetMs));
+    try {
+      await s.setPositionAsync(clamped);
+      setPositionMs(clamped);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const skipBy = (deltaMs: number) => {
+    const dur = durationMsRef.current;
+    if (dur <= 0) return;
+    seekTo(positionMs + deltaMs);
+  };
+
+  const onTrackLayout = (e: LayoutChangeEvent) => {
+    trackWidthRef.current = e.nativeEvent.layout.width;
+  };
+
+  // Convert a touch X (within the track) to a playhead position in ms.
+  const xToMs = (x: number): number => {
+    const w = trackWidthRef.current;
+    const dur = durationMsRef.current;
+    if (w <= 0 || dur <= 0) return 0;
+    const ratio = Math.max(0, Math.min(1, x / w));
+    return ratio * dur;
+  };
+
+  // PanResponder gives us both tap-to-seek and drag-to-scrub in one handler.
+  // The thumb follows the finger live; we only commit a setPositionAsync()
+  // on release so we don't spam the native audio engine.
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: (e) => {
+        wasPlayingBeforeScrubRef.current = isPlaying;
+        // Pause during scrub so audio doesn't keep racing ahead of the thumb.
+        if (isPlaying) {
+          soundRef.current?.pauseAsync().catch(() => {});
+        }
+        setIsScrubbing(true);
+        const ms = xToMs(e.nativeEvent.locationX);
+        setScrubMs(ms);
+        setPositionMs(ms);
+      },
+      onPanResponderMove: (e) => {
+        const ms = xToMs(e.nativeEvent.locationX);
+        setScrubMs(ms);
+        setPositionMs(ms);
+      },
+      onPanResponderRelease: async (e) => {
+        const ms = xToMs(e.nativeEvent.locationX);
+        await seekTo(ms);
+        setIsScrubbing(false);
+        if (wasPlayingBeforeScrubRef.current) {
+          soundRef.current?.playAsync().catch(() => {});
+        }
+        wasPlayingBeforeScrubRef.current = false;
+      },
+      onPanResponderTerminate: async () => {
+        setIsScrubbing(false);
+        if (wasPlayingBeforeScrubRef.current) {
+          soundRef.current?.playAsync().catch(() => {});
+        }
+        wasPlayingBeforeScrubRef.current = false;
+      },
+    }),
+  ).current;
+
+  const fmt = (ms: number) => {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(total / 60);
+    const ss = (total % 60).toString().padStart(2, "0");
+    return `${m}:${ss}`;
+  };
+  const shownMs = isScrubbing ? scrubMs : positionMs;
+  const progress = durationMs > 0 ? Math.min(1, shownMs / durationMs) : 0;
+  const playDisabled = loading || durationMs <= 0;
+  const skipDisabled = playDisabled;
+
+  return (
+    <View style={styles.audioPreviewCard}>
+      <View style={styles.audioPreviewHeader}>
+        <View style={styles.audioPreviewIconWrap}>
+          <Ionicons name="document-text" size={20} color={colors.brand} />
+        </View>
+        <View style={{ flex: 1 }}>
+          {label ? (
+            <Text style={styles.audioPreviewLabel}>{label}</Text>
+          ) : null}
+          <Text style={styles.audioPreviewFilename} numberOfLines={1}>
+            {filename}
+          </Text>
+        </View>
+        {onDiscard ? (
+          <TouchableOpacity onPress={onDiscard} hitSlop={8}>
+            <Ionicons name="close-circle" size={22} color={colors.textTertiary} />
+          </TouchableOpacity>
+        ) : null}
+      </View>
+
+      <View style={styles.audioPreviewControls}>
+        <TouchableOpacity
+          style={[styles.audioSkipBtn, skipDisabled && styles.audioSkipBtnDisabled]}
+          onPress={() => skipBy(-SKIP_MS)}
+          disabled={skipDisabled}
+          activeOpacity={0.7}
+          hitSlop={8}
+          accessibilityLabel="Rewind 10 seconds"
+        >
+          <Ionicons name="play-back" size={16} color={colors.brand} />
+          <Text style={styles.audioSkipLabel}>10</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.audioPlayBtn, playDisabled && styles.audioPlayBtnDisabled]}
+          onPress={togglePlay}
+          disabled={playDisabled}
+          activeOpacity={0.7}
+        >
+          {loading ? (
+            <ActivityIndicator size="small" color={colors.textInverse} />
+          ) : (
+            <Ionicons
+              name={isPlaying ? "pause" : "play"}
+              size={18}
+              color={colors.textInverse}
+            />
+          )}
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.audioSkipBtn, skipDisabled && styles.audioSkipBtnDisabled]}
+          onPress={() => skipBy(SKIP_MS)}
+          disabled={skipDisabled}
+          activeOpacity={0.7}
+          hitSlop={8}
+          accessibilityLabel="Forward 10 seconds"
+        >
+          <Ionicons name="play-forward" size={16} color={colors.brand} />
+          <Text style={styles.audioSkipLabel}>10</Text>
+        </TouchableOpacity>
+
+        <View
+          style={styles.audioProgressHit}
+          onLayout={onTrackLayout}
+          {...panResponder.panHandlers}
+        >
+          <View style={styles.audioProgressTrack}>
+            <View
+              style={[styles.audioProgressFill, { width: `${progress * 100}%` }]}
+            />
+          </View>
+          <View
+            style={[
+              styles.audioProgressThumb,
+              { left: `${progress * 100}%` },
+              isScrubbing && styles.audioProgressThumbActive,
+            ]}
+            pointerEvents="none"
+          />
+        </View>
+        <Text style={styles.audioPreviewTime}>
+          {fmt(shownMs)} / {fmt(durationMs)}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
 export default function RecordScreen() {
   const nav = useNavigation<any>();
   const { width } = useWindowDimensions();
   const isTablet = width >= 768;
+  // Tab navigator's header is hidden for this screen (see App.tsx), so we
+  // add the system safe-area top inset ourselves to keep the heading clear
+  // of the status bar on devices with a notch / Dynamic Island.
+  const insets = useSafeAreaInsets();
 
   // Data — providers come from the shared store (pre-warmed at login).
   const storeProviders = useProviders((s) => s.providers);
@@ -330,6 +619,7 @@ export default function RecordScreen() {
 
   // Selections
   const [providerId, setProviderId] = useState("");
+  const [providerPickerOpen, setProviderPickerOpen] = useState(false);
   const [selectedPatient, setSelectedPatient] = useState<PatientSearchResult | null>(null);
   const [mode, setMode] = useState("ambient");
 
@@ -344,6 +634,9 @@ export default function RecordScreen() {
   const [noteAudioFilename, setNoteAudioFilename] = useState("note_audio.m4a");
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const noteTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Live transcript stays compact (~3 lines tall) but the inner ScrollView
+  // lets the user read the full transcript by scrolling.
+  const transcriptScrollRef = useRef<ScrollView | null>(null);
   const [asrStreaming, setAsrStreaming] = useState(false);
   const [asrPartialText, setAsrPartialText] = useState("");
   const [asrFinalSegments, setAsrFinalSegments] = useState<string[]>([]);
@@ -374,7 +667,6 @@ export default function RecordScreen() {
   // stays in Baltimore mode without re-toggling every session.
   const eclipseLocation = useSettings((s) => s.eclipseLocation);
   const setEclipseLocation = useSettings((s) => s.setEclipseLocation);
-  const [locationPickerOpen, setLocationPickerOpen] = useState(false);
 
   // Logged-in user, used to auto-select their matching provider entry.
   const authUser = useAuthStore((s) => s.user);
@@ -426,9 +718,10 @@ export default function RecordScreen() {
   }, [providers, authUserName, authUserEmail]);
 
   // Patient search — fetch once per provider/date, filter locally.
-  // (state declared above next to `patients`.)
+  // A local `cancelled` flag prevents a late-arriving response from the
+  // previous provider/date/location from overwriting state after the user
+  // has switched selections.
   useEffect(() => {
-    // Hit the network when provider/date changes.
     setSelectedPatient(null);
     setPatientQuery("");
     setPatients([]);
@@ -438,9 +731,12 @@ export default function RecordScreen() {
     if (!providerId) {
       return;
     }
+
+    let cancelled = false;
     setPatientsLoading(true);
     fetchPatientsByProviderDate(providerId, appointmentDate, "", eclipseLocation)
       .then((list) => {
+        if (cancelled) return;
         const sortedList = [...list].sort((a, b) =>
           normalize(`${a.last_name} ${a.first_name}`).localeCompare(normalize(`${b.last_name} ${b.first_name}`)),
         );
@@ -458,11 +754,17 @@ export default function RecordScreen() {
         }
       })
       .catch((err) => {
+        if (cancelled) return;
         setPatientLoadError(err instanceof Error ? err.message : "Failed to load patients");
       })
       .finally(() => {
+        if (cancelled) return;
         setPatientsLoading(false);
       });
+
+    return () => {
+      cancelled = true;
+    };
   }, [providerId, appointmentDate, apiUrl, eclipseLocation]);
 
   // Local filtering when user types
@@ -791,7 +1093,7 @@ export default function RecordScreen() {
               asrWsRef.current.send(payload);
               asrReadOffsetRef.current = size;
               asrChunksSentRef.current += 1;
-              setAsrStatus("Streaming audio...");
+              setAsrStatus("Transcribing...");
             }
           } catch {
             // Keep recording flow stable even if ASR chunk read fails.
@@ -1100,7 +1402,11 @@ export default function RecordScreen() {
   return (
     <ScrollView
       style={styles.container}
-      contentContainerStyle={[styles.content, isTablet && styles.tabletContent]}
+      contentContainerStyle={[
+        styles.content,
+        { paddingTop: insets.top + spacing.lg },
+        isTablet && styles.tabletContent,
+      ]}
     >
       <Text style={styles.title}>Record Encounter</Text>
       <Text style={styles.subtitle}>Capture audio to generate a clinical note</Text>
@@ -1118,66 +1424,37 @@ export default function RecordScreen() {
 
       {/* Location — selects which Eclipse source_system (Pennsylvania=Eclipse,
           Baltimore=Micro) drives the provider + patient queries. Persisted in
-          settings so it carries across sessions. */}
+          settings so it carries across sessions. Segmented control style
+          matches the Mode chooser below for a consistent feel. */}
       <Card>
         <Text style={styles.label}>Location</Text>
         <Text style={styles.sublabel}>
           Choose the office whose schedule you’re working from. Switching
           locations refreshes the provider and patient lists.
         </Text>
-        <TouchableOpacity
-          style={styles.locationDropdown}
-          onPress={() => setLocationPickerOpen(true)}
-        >
-          <Ionicons name="business-outline" size={16} color={colors.textSecondary} />
-          <Text style={styles.locationDropdownText}>
-            {ECLIPSE_LOCATION_LABEL[eclipseLocation]}
-          </Text>
-          <Ionicons name="chevron-down" size={16} color={colors.textTertiary} />
-        </TouchableOpacity>
-      </Card>
-
-      <Modal
-        visible={locationPickerOpen}
-        animationType="fade"
-        transparent
-        onRequestClose={() => setLocationPickerOpen(false)}
-      >
-        <TouchableOpacity
-          style={styles.locationModalBackdrop}
-          activeOpacity={1}
-          onPress={() => setLocationPickerOpen(false)}
-        >
-          <View style={styles.locationModalCard}>
-            <Text style={styles.locationModalTitle}>Select Location</Text>
-            {(["pennsylvania", "baltimore"] as EclipseLocation[]).map((loc) => {
-              const active = eclipseLocation === loc;
-              return (
-                <TouchableOpacity
-                  key={loc}
-                  style={[styles.locationModalRow, active && styles.locationModalRowActive]}
-                  onPress={() => {
-                    setEclipseLocation(loc);
-                    setLocationPickerOpen(false);
-                  }}
+        <View style={[styles.modeOptionsRow, { marginTop: spacing.sm }]}>
+          {(["pennsylvania", "baltimore"] as EclipseLocation[]).map((loc) => {
+            const active = eclipseLocation === loc;
+            return (
+              <TouchableOpacity
+                key={loc}
+                onPress={() => {
+                  if (loc !== eclipseLocation) setEclipseLocation(loc);
+                }}
+                style={[styles.modeOptionCard, active && styles.modeOptionCardActive]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active }}
+              >
+                <Text
+                  style={[styles.modeOptionTitle, active && styles.modeOptionTitleActive]}
                 >
-                  <Text
-                    style={[
-                      styles.locationModalRowText,
-                      active && styles.locationModalRowTextActive,
-                    ]}
-                  >
-                    {ECLIPSE_LOCATION_LABEL[loc]}
-                  </Text>
-                  {active ? (
-                    <Ionicons name="checkmark" size={18} color={colors.brand} />
-                  ) : null}
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-        </TouchableOpacity>
-      </Modal>
+                  {ECLIPSE_LOCATION_LABEL[loc]}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </Card>
 
       {/* Provider */}
       <Card>
@@ -1190,16 +1467,26 @@ export default function RecordScreen() {
           <Text style={styles.sublabel}>
             {providerLoadError ? `Unable to load providers: ${providerLoadError}` : "No providers found."}
           </Text>
+        ) : providerId && !providerPickerOpen ? (
+          // Collapsed selected state: shows just the chosen provider plus a
+          // "Change" affordance, so a stray tap can't pick a different name.
+          <TouchableOpacity
+            style={styles.selectedProviderBanner}
+            onPress={() => {
+              setProviderQuery("");
+              setProviderPickerOpen(true);
+            }}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="checkmark-circle" size={18} color={colors.brand} />
+            <Text style={styles.selectedProviderText} numberOfLines={1}>
+              {providers.find((p) => p.id === providerId)?.name ?? providerId}
+            </Text>
+            <Text style={styles.selectedProviderChange}>Change</Text>
+            <Ionicons name="chevron-down" size={16} color={colors.brand} />
+          </TouchableOpacity>
         ) : (
           <>
-            {providerId ? (
-              <View style={styles.selectedProviderBanner}>
-                <Ionicons name="checkmark-circle" size={16} color={colors.brand} />
-                <Text style={styles.selectedProviderText}>
-                  Selected: {providers.find((p) => p.id === providerId)?.name ?? providerId}
-                </Text>
-              </View>
-            ) : null}
             <View style={styles.searchBox}>
               <Ionicons name="search" size={16} color={colors.textTertiary} />
               <TextInput
@@ -1208,7 +1495,13 @@ export default function RecordScreen() {
                 placeholder="Search providers..."
                 style={styles.searchInput}
                 placeholderTextColor={colors.textTertiary}
+                autoFocus={providerPickerOpen}
               />
+              {providerId ? (
+                <TouchableOpacity onPress={() => setProviderPickerOpen(false)}>
+                  <Ionicons name="close" size={18} color={colors.textTertiary} />
+                </TouchableOpacity>
+              ) : null}
             </View>
             <Text style={styles.providerCountText}>
               Showing {filteredProviders.length} of {providers.length} providers
@@ -1216,28 +1509,52 @@ export default function RecordScreen() {
             <FlatList
               data={filteredProviders}
               keyExtractor={(p) => p.id}
-              style={styles.providerList}
-              horizontal
+              style={styles.providerListVertical}
               nestedScrollEnabled
               keyboardShouldPersistTaps="handled"
-              showsHorizontalScrollIndicator
+              showsVerticalScrollIndicator
               renderItem={({ item }) => {
                 const isActive = providerId === item.id;
                 return (
                   <TouchableOpacity
-                    style={[styles.providerListRow, isActive && styles.providerListRowActive]}
-                    onPress={() => setProviderId(item.id)}
+                    style={[
+                      styles.providerVerticalRow,
+                      isActive && styles.providerVerticalRowActive,
+                    ]}
+                    onPress={() => {
+                      setProviderId(item.id);
+                      setProviderQuery("");
+                      setProviderPickerOpen(false);
+                    }}
+                    activeOpacity={0.7}
                   >
-                    <Text style={[styles.providerListName, isActive && styles.providerListNameActive]}>
+                    <Text
+                      style={[
+                        styles.providerVerticalRowText,
+                        isActive && styles.providerVerticalRowTextActive,
+                      ]}
+                      numberOfLines={1}
+                    >
                       {item.name ?? item.id}
                     </Text>
+                    {isActive ? (
+                      <Ionicons name="checkmark" size={18} color={colors.brand} />
+                    ) : null}
                   </TouchableOpacity>
                 );
               }}
+              ItemSeparatorComponent={() => <View style={styles.providerVerticalSeparator} />}
               ListEmptyComponent={
                 <Text style={styles.sublabel}>No providers found.</Text>
               }
             />
+          </>
+        )}
+
+        {/* Appointment date is always visible (independent of provider picker
+            collapsed/expanded state) once the provider list has loaded. */}
+        {providersLoaded && providers.length > 0 ? (
+          <>
             <Text style={styles.dateLabel}>Appointment Date</Text>
             {Platform.OS === "ios" ? (
               <View style={styles.iosDatePickerCompactWrap}>
@@ -1279,7 +1596,7 @@ export default function RecordScreen() {
               </TouchableOpacity>
             )}
           </>
-        )}
+        ) : null}
       </Card>
 
       {/* Patient */}
@@ -1442,23 +1759,16 @@ export default function RecordScreen() {
             </View>
           </View>
         ) : (
-          <View style={styles.recordedRow}>
-            <Ionicons name="document-text" size={22} color={colors.brand} />
-            <View style={{ flex: 1, marginLeft: spacing.sm }}>
-              <Text style={{ fontSize: fontSize.sm, fontWeight: "600", color: colors.text }}>
-                Audio ready{duration > 0 ? ` (${formatTime(duration)})` : ""}
-              </Text>
-              <Text style={{ fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 }}>{audioFilename}</Text>
-              {mode === "ambient" && noteAudioUri ? (
-                <Text style={{ fontSize: fontSize.xs, color: colors.textSecondary, marginTop: 2 }}>
-                  Notes audio: {noteAudioFilename}
-                </Text>
-              ) : null}
-            </View>
-            <TouchableOpacity onPress={discardRecording}>
-              <Ionicons name="close-circle" size={22} color={colors.textTertiary} />
-            </TouchableOpacity>
-          </View>
+          <AudioPreviewCard
+            uri={recordingUri}
+            filename={audioFilename}
+            label={
+              duration > 0
+                ? `Audio ready · ${formatTime(duration)}`
+                : "Audio ready"
+            }
+            onDiscard={discardRecording}
+          />
         )}
         {mode === "ambient" && recordingUri ? (
           <View style={styles.noteControls}>
@@ -1468,13 +1778,13 @@ export default function RecordScreen() {
                 <View style={styles.row}>
                   <View style={styles.pulseDot} />
                   <Text style={[styles.recordingLabel, { color: colors.error }]}>
-                    Recording notes... {formatTime(noteDuration)}
+                    Recording Conversation... {formatTime(noteDuration)}
                   </Text>
                 </View>
                 <View style={[styles.row, { marginTop: spacing.sm }]}>
                   <TouchableOpacity style={styles.uploadBtn} onPress={stopNoteRecording}>
                     <Ionicons name="stop" size={16} color={colors.text} />
-                    <Text style={styles.uploadBtnText}>Stop Notes</Text>
+                    <Text style={styles.uploadBtnText}>Stop Recording</Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.uploadBtn, { marginLeft: spacing.sm }]} onPress={clearNoteAudio}>
                     <Ionicons name="trash-outline" size={16} color={colors.text} />
@@ -1484,9 +1794,11 @@ export default function RecordScreen() {
               </>
             ) : noteAudioUri ? (
               <>
-                <Text style={{ fontSize: fontSize.xs, color: colors.textSecondary }}>
-                  Notes audio ready: {noteAudioFilename}
-                </Text>
+                <AudioPreviewCard
+                  uri={noteAudioUri}
+                  filename={noteAudioFilename}
+                  label="Notes audio ready"
+                />
                 <View style={[styles.row, { marginTop: spacing.sm }]}>
                   <TouchableOpacity
                     style={styles.uploadBtn}
@@ -1528,23 +1840,57 @@ export default function RecordScreen() {
             )}
           </View>
         ) : null}
-        {(asrStreaming || asrPartialText || asrFinalSegments.length > 0 || asrError) && (
-          <View style={{ marginTop: spacing.md, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: spacing.sm }}>
-            <Text style={styles.sublabel}>Live Transcript</Text>
-            {asrError ? <Text style={{ color: colors.error, fontSize: fontSize.xs }}>{asrError}</Text> : null}
-            {!asrError && asrStatus ? (
-              <Text style={{ color: colors.textSecondary, fontSize: fontSize.xs }}>{asrStatus}</Text>
-            ) : null}
-            {asrPartialText ? (
-              <Text style={{ color: colors.textSecondary, fontSize: fontSize.xs }}>{asrPartialText}</Text>
-            ) : null}
-            {asrFinalSegments.slice(-3).map((seg, idx) => (
-              <Text key={`${idx}-${seg.slice(0, 10)}`} style={{ color: colors.text, fontSize: fontSize.xs, marginTop: 2 }}>
-                {seg}
-              </Text>
-            ))}
-          </View>
-        )}
+        {stage === "recording" &&
+          (asrStreaming ||
+            asrPartialText ||
+            asrFinalSegments.length > 0 ||
+            asrError) && (
+            <View style={styles.transcriptWrap}>
+              <View style={styles.transcriptHeaderRow}>
+                <View style={styles.transcriptLiveDot} />
+                <Text style={styles.transcriptHeaderText}>
+                  Live transcript · read-only preview
+                </Text>
+              </View>
+              {asrError ? (
+                <Text style={styles.transcriptError}>{asrError}</Text>
+              ) : asrStatus ? (
+                <Text style={styles.transcriptStatus}>{asrStatus}</Text>
+              ) : null}
+              <ScrollView
+                ref={transcriptScrollRef}
+                style={styles.transcriptScroll}
+                contentContainerStyle={styles.transcriptScrollContent}
+                nestedScrollEnabled
+                showsVerticalScrollIndicator
+                // Block any keyboard / focus interaction so it cannot be
+                // mistaken for an editable text input.
+                scrollEnabled
+                onContentSizeChange={() => {
+                  // Keep the latest transcript text visible as new segments stream in.
+                  transcriptScrollRef.current?.scrollToEnd({ animated: true });
+                }}
+              >
+                {asrFinalSegments.map((seg, idx) => (
+                  <Text
+                    key={`${idx}-${seg.slice(0, 10)}`}
+                    style={styles.transcriptFinalText}
+                    selectable={false}
+                  >
+                    {seg}
+                  </Text>
+                ))}
+                {asrPartialText ? (
+                  <Text
+                    style={styles.transcriptPartialText}
+                    selectable={false}
+                  >
+                    {asrPartialText}
+                  </Text>
+                ) : null}
+              </ScrollView>
+            </View>
+          )}
       </Card>
 
       {/* Submit / Progress */}
@@ -1562,11 +1908,11 @@ export default function RecordScreen() {
         <Card>
           <ProgressBar
             progress={progress}
-            color={stage === "error" ? colors.error : stage === "complete" ? colors.brand : colors.indigo}
+            color={stage === "error" ? colors.error : colors.brand}
           />
           <View style={[styles.row, { marginTop: spacing.md }]}>
             {(stage === "creating" || stage === "uploading" || stage === "processing") && (
-              <ActivityIndicator size="small" color={colors.indigo} style={{ marginRight: spacing.sm }} />
+              <ActivityIndicator size="small" color={colors.brand} style={{ marginRight: spacing.sm }} />
             )}
             {stage === "complete" && (
               <Ionicons name="checkmark-circle" size={18} color={colors.brand} style={{ marginRight: spacing.sm }} />
@@ -1618,10 +1964,82 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
   content: { padding: spacing.lg, gap: spacing.md },
   tabletContent: { maxWidth: 640, alignSelf: "center", width: "100%" },
-  title: { fontSize: fontSize.xxl, fontWeight: "700", color: colors.text },
-  subtitle: { fontSize: fontSize.sm, color: colors.textSecondary, marginBottom: spacing.sm },
+  title: {
+    fontSize: fontSize.xxl,
+    fontWeight: "700",
+    color: colors.brand,
+    textAlign: "center",
+  },
+  subtitle: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    textAlign: "center",
+    marginBottom: spacing.sm,
+  },
   label: { fontSize: fontSize.sm, fontWeight: "600", color: colors.text },
   sublabel: { fontSize: fontSize.xs, fontWeight: "500", color: colors.textSecondary, marginBottom: spacing.xs },
+
+  // Live transcript: compact ~3-line viewport shown only while recording, with
+  // an unmistakably non-editable look (soft gray fill, no input-style border,
+  // pulsing "live" header) so providers don't try to type corrections into it.
+  transcriptWrap: {
+    marginTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingTop: spacing.sm,
+  },
+  transcriptHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    marginBottom: spacing.xs,
+  },
+  transcriptLiveDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: colors.error, // red "REC" indicator
+  },
+  transcriptHeaderText: {
+    fontSize: fontSize.xs,
+    fontWeight: "600",
+    color: colors.textSecondary,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  transcriptScroll: {
+    maxHeight: 72, // ~3 lines at 13px font + 18px line-height + padding
+    borderRadius: radius.sm,
+    backgroundColor: "#F3F4F6", // soft gray fill — clearly not an input
+  },
+  transcriptScrollContent: {
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+  },
+  transcriptFinalText: {
+    color: colors.textSecondary,
+    fontSize: fontSize.sm,
+    lineHeight: 18,
+    marginTop: 2,
+  },
+  transcriptPartialText: {
+    color: colors.textTertiary,
+    fontSize: fontSize.sm,
+    lineHeight: 18,
+    marginTop: 2,
+    fontStyle: "italic",
+  },
+  transcriptStatus: {
+    color: colors.textTertiary,
+    fontSize: fontSize.xs,
+    marginBottom: spacing.xs,
+  },
+  transcriptError: {
+    color: colors.error,
+    fontSize: fontSize.xs,
+    marginBottom: spacing.xs,
+  },
+
   row: { flexDirection: "row", alignItems: "center" },
   chip: {
     paddingHorizontal: spacing.md,
@@ -1770,84 +2188,62 @@ const styles = StyleSheet.create({
   selectedProviderBanner: {
     marginTop: spacing.sm,
     marginBottom: spacing.xs,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
     borderRadius: radius.md,
     borderWidth: 1,
     borderColor: "#86EFAC",
     backgroundColor: "#ECFDF5",
     flexDirection: "row",
     alignItems: "center",
-    gap: spacing.xs,
+    gap: spacing.sm,
   },
   selectedProviderText: {
     color: colors.brand,
-    fontSize: fontSize.xs,
+    fontSize: fontSize.sm,
     fontWeight: "600",
     flex: 1,
   },
-  locationDropdown: {
-    marginTop: spacing.sm,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
-    borderRadius: radius.md,
+  selectedProviderChange: {
+    color: colors.brand,
+    fontSize: fontSize.xs,
+    fontWeight: "700",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  // Vertical provider list shown when picking / changing a provider.
+  providerListVertical: {
+    marginTop: spacing.xs,
+    maxHeight: 280,
     borderWidth: 1,
     borderColor: colors.border,
+    borderRadius: radius.md,
     backgroundColor: colors.card,
+  },
+  providerVerticalRow: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
     gap: spacing.sm,
   },
-  locationDropdownText: {
-    flex: 1,
-    fontSize: fontSize.sm,
-    fontWeight: "600",
-    color: colors.text,
-  },
-  locationModalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(15, 23, 42, 0.45)",
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: spacing.lg,
-  },
-  locationModalCard: {
-    width: "100%",
-    maxWidth: 360,
-    backgroundColor: colors.card,
-    borderRadius: radius.lg,
-    paddingVertical: spacing.md,
-    paddingHorizontal: spacing.md,
-    shadowColor: "#000",
-    shadowOpacity: 0.15,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 6,
-  },
-  locationModalTitle: {
-    fontSize: fontSize.md,
-    fontWeight: "700",
-    color: colors.text,
-    marginBottom: spacing.sm,
-  },
-  locationModalRow: {
-    paddingVertical: spacing.md,
-    paddingHorizontal: spacing.sm,
-    borderRadius: radius.md,
-    flexDirection: "row",
-    alignItems: "center",
-  },
-  locationModalRowActive: {
+  providerVerticalRowActive: {
     backgroundColor: "#ECFDF5",
   },
-  locationModalRowText: {
-    flex: 1,
+  providerVerticalRowText: {
     fontSize: fontSize.sm,
-    fontWeight: "600",
     color: colors.text,
+    fontWeight: "500",
+    flex: 1,
   },
-  locationModalRowTextActive: {
+  providerVerticalRowTextActive: {
     color: colors.brand,
+    fontWeight: "700",
+  },
+  providerVerticalSeparator: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: colors.borderLight,
   },
   patientRow: {
     paddingVertical: spacing.sm,
@@ -1920,6 +2316,123 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     padding: spacing.md,
     marginTop: spacing.md,
+  },
+
+  // Audio preview card — used for both the main recording and the notes
+  // audio. Soft mint background with brand-green play button so it reads
+  // as a positive "ready to verify" state and clearly separates each file.
+  audioPreviewCard: {
+    backgroundColor: "#ECFDF5",
+    borderWidth: 1,
+    borderColor: "#86EFAC",
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginTop: spacing.sm,
+    gap: spacing.sm,
+  },
+  audioPreviewHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  audioPreviewIconWrap: {
+    width: 32,
+    height: 32,
+    borderRadius: radius.sm,
+    backgroundColor: "#D1FAE5",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  audioPreviewLabel: {
+    fontSize: fontSize.xs,
+    fontWeight: "700",
+    color: colors.brand,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  audioPreviewFilename: {
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.text,
+    marginTop: 2,
+  },
+  audioPreviewControls: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  audioPlayBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: colors.brand,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  audioPlayBtnDisabled: {
+    backgroundColor: colors.textTertiary,
+  },
+  audioProgressHit: {
+    flex: 1,
+    height: 28,
+    justifyContent: "center",
+    paddingHorizontal: 6,
+  },
+  audioProgressTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: "#A7F3D0",
+    overflow: "hidden",
+  },
+  audioProgressFill: {
+    height: "100%",
+    backgroundColor: colors.brand,
+  },
+  audioProgressThumb: {
+    position: "absolute",
+    top: "50%",
+    width: 14,
+    height: 14,
+    marginLeft: -7,
+    marginTop: -7,
+    borderRadius: 7,
+    backgroundColor: colors.brand,
+    borderWidth: 2,
+    borderColor: "#FFFFFF",
+  },
+  audioProgressThumbActive: {
+    width: 18,
+    height: 18,
+    marginLeft: -9,
+    marginTop: -9,
+    borderRadius: 9,
+  },
+  audioSkipBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+    borderRadius: 14,
+    backgroundColor: "#D1FAE5",
+    gap: 2,
+    minWidth: 36,
+  },
+  audioSkipBtnDisabled: {
+    opacity: 0.5,
+  },
+  audioSkipLabel: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: colors.brand,
+    fontVariant: ["tabular-nums"],
+  },
+  audioPreviewTime: {
+    fontSize: fontSize.xs,
+    fontVariant: ["tabular-nums"],
+    color: colors.textSecondary,
+    minWidth: 70,
+    textAlign: "right",
   },
   noteControls: {
     marginTop: spacing.md,

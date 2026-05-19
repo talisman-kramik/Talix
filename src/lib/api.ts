@@ -371,13 +371,35 @@ function providersCacheKey(location: EclipseLocation): string {
   return `${ECLIPSE_PROVIDERS_CACHE_KEY_PREFIX}.${location}`;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 8000): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 8000,
+  externalSignal?: AbortSignal,
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Chain an externally-supplied signal into the timeout controller so the
+  // caller can abort the fetch (e.g. on location switch) without losing the
+  // timeout behaviour.
+  let onExternalAbort: (() => void) | null = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      onExternalAbort = () => controller.abort();
+      externalSignal.addEventListener("abort", onExternalAbort);
+    }
+  }
+
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timer);
+    if (externalSignal && onExternalAbort) {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+    }
   }
 }
 
@@ -443,10 +465,11 @@ async function fetchEclipseQueryExecOnce(
   endpointBase: string,
   token: string,
   params: Record<string, string>,
-  options?: { timeoutMs?: number; retries?: number },
+  options?: { timeoutMs?: number; retries?: number; signal?: AbortSignal },
 ): Promise<any[]> {
   const timeoutMs = options?.timeoutMs ?? 120000;
   const retries = options?.retries ?? 3;
+  const signal = options?.signal;
 
   const search = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) search.append(k, v);
@@ -454,6 +477,11 @@ async function fetchEclipseQueryExecOnce(
 
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < retries; attempt += 1) {
+    // Bail out of the retry loop the moment the caller aborts — don't burn
+    // through a fresh fetch + backoff just to hand back the same AbortError.
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
     try {
       const res = await fetchWithTimeout(
         url,
@@ -461,6 +489,7 @@ async function fetchEclipseQueryExecOnce(
           headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
         },
         timeoutMs,
+        signal,
       );
       if (!res.ok) {
         const body = await res.text().catch(() => "");
@@ -470,6 +499,12 @@ async function fetchEclipseQueryExecOnce(
       return Array.isArray((json as any)?.data) ? (json as any).data : [];
     } catch (err) {
       lastErr = err;
+      const isAbort =
+        (err as { name?: string } | null)?.name === "AbortError" ||
+        signal?.aborted === true;
+      if (isAbort) {
+        throw err;
+      }
       const delayMs = Math.min(4000, 1000 * 2 ** attempt) + Math.floor(Math.random() * 250);
       await new Promise((r) => setTimeout(r, delayMs));
     }
@@ -532,6 +567,7 @@ function getEclipseProviderKey(row: any): string | null {
 
 export const fetchProviders = async (
   location: EclipseLocation = "pennsylvania",
+  options?: { signal?: AbortSignal },
 ): Promise<ProviderSummary[]> => {
   const eclipse = getEclipseConfig();
   if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
@@ -539,12 +575,18 @@ export const fetchProviders = async (
   }
 
   const sourceSystem = ECLIPSE_LOCATION_TO_SOURCE_SYSTEM[location];
+  const signal = options?.signal;
 
   const now = Date.now();
   const cached = eclipseProvidersCache.get(location);
   if (cached && now - cached.fetchedAt < ECLIPSE_ROWS_TTL_MS) return cached.providers;
-  const inFlight = eclipseProvidersInFlight.get(location);
-  if (inFlight) return inFlight;
+  // Skip the in-flight dedupe when an external signal is passed — different
+  // callers may want to cancel independently, so they each get their own
+  // request rather than sharing a promise that someone else can abort.
+  if (!signal) {
+    const inFlight = eclipseProvidersInFlight.get(location);
+    if (inFlight) return inFlight;
+  }
 
   const endpointBase = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
   const baseParams: Record<string, string> = {
@@ -570,12 +612,18 @@ export const fetchProviders = async (
             endpointBase,
             eclipse.token,
             { ...baseParams, perPage },
-            { timeoutMs: 120000, retries: 3 },
+            { timeoutMs: 120000, retries: 3, signal },
           )) as EclipseProviderRow[];
           lastErr = null;
           break;
         } catch (err) {
           lastErr = err;
+          // Don't keep trying smaller page sizes after a user-initiated abort —
+          // propagate the cancel immediately.
+          const isAbort =
+            (err as { name?: string } | null)?.name === "AbortError" ||
+            signal?.aborted === true;
+          if (isAbort) throw err;
         }
       }
       if (lastErr) throw lastErr;
@@ -600,7 +648,16 @@ export const fetchProviders = async (
       await persistEclipseProviders(location, sorted);
       return sorted;
     } catch (networkErr) {
-      // Fallback to in-memory stale cache or persisted cache during transient 5xx.
+      // A user-initiated abort must propagate as-is — don't fall back to a
+      // cached list, since the caller is intentionally switching away from
+      // this location.
+      const isAbort =
+        (networkErr as { name?: string } | null)?.name === "AbortError" ||
+        signal?.aborted === true;
+      if (isAbort) throw networkErr;
+
+      // Otherwise fall back to in-memory stale cache or persisted cache
+      // during transient 5xx.
       const stale = eclipseProvidersCache.get(location);
       if (stale?.providers?.length) return stale.providers;
       const persisted = await loadPersistedEclipseProviders(location);
@@ -611,10 +668,14 @@ export const fetchProviders = async (
       throw networkErr;
     }
   })().finally(() => {
-    eclipseProvidersInFlight.delete(location);
+    if (!signal) {
+      eclipseProvidersInFlight.delete(location);
+    }
   });
 
-  eclipseProvidersInFlight.set(location, promise);
+  if (!signal) {
+    eclipseProvidersInFlight.set(location, promise);
+  }
   return promise;
 };
 

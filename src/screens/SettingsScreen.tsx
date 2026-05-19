@@ -15,6 +15,7 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import * as WebBrowser from "expo-web-browser";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Card from "../components/Card";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
@@ -29,6 +30,9 @@ const APP_SCHEME = "msauth.com.talismansolutions.talixapp";
 export default function SettingsScreen() {
   const { width } = useWindowDimensions();
   const isTablet = width >= 768;
+  // Tab header is hidden for this screen (see App.tsx), so add the system
+  // safe-area top inset ourselves to keep the title clear of the status bar.
+  const insets = useSafeAreaInsets();
   const { isOnline, checkConnectivity } = useOfflineStore();
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
@@ -94,7 +98,11 @@ export default function SettingsScreen() {
   return (
     <ScrollView
       style={styles.container}
-      contentContainerStyle={[styles.content, isTablet && styles.tabletContent]}
+      contentContainerStyle={[
+        styles.content,
+        { paddingTop: insets.top + spacing.lg },
+        isTablet && styles.tabletContent,
+      ]}
     >
       <Text style={styles.title}>Settings</Text>
 
@@ -180,9 +188,9 @@ export default function SettingsScreen() {
       <Card>
         <Text style={styles.label}>About</Text>
         <Text style={styles.hint}>Talix v1.0.0</Text>
-        <Text style={styles.hint}>Talisman Solutions</Text>
+        <Text style={styles.hint}>A Talisman Solutions product</Text>
         <Text style={[styles.hint, { marginTop: spacing.sm }]}>
-          HIPAA-compliant medical documentation. All audio is processed on your own servers — zero PHI egress.
+          An AI-powered iOS medical documentation platform for generating structured SOAP notes with secure and HIPAA-compliant clinical workflows.
         </Text>
       </Card>
 
@@ -206,7 +214,13 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
   content: { padding: spacing.lg, gap: spacing.md },
   tabletContent: { maxWidth: 640, alignSelf: "center", width: "100%" },
-  title: { fontSize: fontSize.xxl, fontWeight: "700", color: colors.text },
+  title: {
+    fontSize: fontSize.xxl,
+    fontWeight: "700",
+    color: colors.brand,
+    textAlign: "center",
+    marginBottom: spacing.sm,
+  },
   label: { fontSize: fontSize.sm, fontWeight: "600", color: colors.text },
   hint: { fontSize: fontSize.xs, color: colors.textSecondary, marginTop: spacing.xs },
   row: { flexDirection: "row", alignItems: "center", gap: spacing.sm },

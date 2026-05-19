@@ -16,6 +16,7 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import Badge from "../components/Badge";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
@@ -65,6 +66,9 @@ export default function EncountersScreen() {
   const { width } = useWindowDimensions();
   const isTablet = width >= 768;
   const numColumns = 1;
+  // Stack header is hidden for this screen (see App.tsx), so we add the
+  // system safe-area top inset ourselves to clear the status bar.
+  const insets = useSafeAreaInsets();
   const apiUrl = useSettings((s) => s.apiUrl);
   const eclipseLocation = useSettings((s) => s.eclipseLocation);
 
@@ -313,6 +317,11 @@ export default function EncountersScreen() {
 
   return (
     <View style={styles.container}>
+      {/* In-screen header (replaces the framework nav-bar title). */}
+      <View style={[styles.header, { paddingTop: insets.top + spacing.md }]}>
+        <Text style={styles.headerTitle}>SOAP Notes</Text>
+      </View>
+
       {/* Search bar */}
       <View style={styles.topSection}>
         <View style={styles.searchBox}>
@@ -493,6 +502,22 @@ const CHIP_HEIGHT = 32;
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
+
+  // In-screen header replacing the hidden stack-nav title.
+  header: {
+    backgroundColor: colors.card,
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.borderLight,
+    alignItems: "center",
+  },
+  headerTitle: {
+    fontSize: fontSize.xxl,
+    fontWeight: "700",
+    color: colors.brand,
+    textAlign: "center",
+  },
 
   // Top section
   topSection: {

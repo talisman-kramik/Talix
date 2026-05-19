@@ -40,15 +40,24 @@ function EncountersStackScreen() {
         headerStyle: { backgroundColor: colors.card },
       }}
     >
+      {/* List view renders its own in-screen heading, so hide the stack
+          header here to avoid duplicate "SOAP Notes" titles. */}
       <EncounterStack.Screen
         name="EncountersList"
         component={EncountersScreen}
-        options={{ title: "SOAP Notes" }}
+        options={{ headerShown: false }}
       />
+      {/* Detail view keeps the stack header so users get a back button.
+          `headerBackButtonDisplayMode: "minimal"` drops the previous-screen
+          label ("SOAP Notes") next to the chevron so the only title shown
+          is the centered "SOAP Note" page title. */}
       <EncounterStack.Screen
         name="EncounterDetail"
         component={EncounterDetailScreen}
-        options={{ title: "SOAP Note" }}
+        options={{
+          title: "SOAP Note",
+          headerBackButtonDisplayMode: "minimal",
+        }}
       />
     </EncounterStack.Navigator>
   );
@@ -178,7 +187,10 @@ export default function App() {
       <StatusBar style="dark" />
       <Tab.Navigator
         screenOptions={({ route }) => ({
-          headerShown: route.name !== "Encounters",
+          // Every tab renders its own brand-green centered heading inside the
+          // screen content, so the framework header is hidden globally to
+          // avoid duplicate / redundant titles at the top of the screen.
+          headerShown: false,
           headerStyle: { backgroundColor: colors.card },
           headerTintColor: colors.text,
           tabBarActiveTintColor: colors.brand,
