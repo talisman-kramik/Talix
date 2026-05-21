@@ -34,6 +34,7 @@ import {
   createEncounter,
   resolveEncounterProviderId,
   uploadEncounterAudio,
+  buildEncounterDetails,
   getWsUrl,
   ECLIPSE_LOCATION_LABEL,
   type EclipseLocation,
@@ -1295,12 +1296,24 @@ export default function RecordScreen() {
       setStatusMsg("Uploading audio...");
       setProgress(5);
 
+      // Build demographics for the web sync workflow
+      const demographics = buildEncounterDetails({
+        providerName: selectedProviderName || encounterProviderId,
+        patientName: patientNameForRequest,
+        patientDob: selectedPatient.date_of_birth || "",
+        accountNumber: selectedPatient.mrn || "",
+        caseName: FRONTEND_PARITY_VISIT_TYPE,
+        locationName: selectedPatient.location || "",
+        systemLocation: eclipseLocation,
+      });
+
       const result = await uploadEncounterAudio(
         effectiveEncounterId,
         recordingUri,
         audioFilename,
         effectiveNoteAudioUri,
         effectiveNoteAudioFilename,
+        demographics,
       );
 
       setStage("processing");
