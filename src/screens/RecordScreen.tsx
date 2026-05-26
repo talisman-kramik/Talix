@@ -34,6 +34,7 @@ import {
   createEncounter,
   resolveEncounterProviderId,
   uploadEncounterAudio,
+  fetchEncounterStatus,
   getWsUrl,
   ECLIPSE_LOCATION_LABEL,
   type EclipseLocation,
@@ -297,6 +298,34 @@ function base64ToUint8Array(base64: string): Uint8Array {
     }
   }
   return new Uint8Array(out);
+}
+
+/**
+ * Locate the end of a RIFF/WAV header by scanning for the ASCII "data" chunk
+ * marker and returning the byte offset immediately after the 8-byte chunk
+ * descriptor ("data" + 4-byte little-endian size). Returns -1 if the marker
+ * isn't found within the provided bytes (caller should wait for more data).
+ *
+ * Why: iOS AVAudioRecorder does not always emit the textbook 44-byte WAV
+ * header — depending on the configured options it can include additional
+ * FACT / LIST / INFO / JUNK chunks (commonly 46, 60, 78+ bytes). Hard-coding
+ * 44 means a few stale header bytes get sent as PCM samples on the very
+ * first chunk, which the ASR engine treats as noise and never recovers
+ * sentence alignment from.
+ */
+function findWavDataOffset(bytes: Uint8Array): number {
+  const max = Math.min(bytes.byteLength - 8, 4096);
+  for (let i = 12; i <= max; i++) {
+    if (
+      bytes[i] === 0x64 && // 'd'
+      bytes[i + 1] === 0x61 && // 'a'
+      bytes[i + 2] === 0x74 && // 't'
+      bytes[i + 3] === 0x61 // 'a'
+    ) {
+      return i + 8; // skip "data" + 4-byte size field
+    }
+  }
+  return -1;
 }
 
 // Reusable audio preview / playback card. Lets providers verify the recorded
@@ -647,6 +676,12 @@ export default function RecordScreen() {
   const asrReadOffsetRef = useRef(0);
   const asrChunksSentRef = useRef(0);
   const asrPcmHeaderSkippedRef = useRef(false);
+  // Computed length of the WAV header on the first read. iOS AVAudioRecorder
+  // does not always write a fixed 44-byte header (it can include FACT / LIST
+  // / JUNK chunks), so we locate the "data" chunk dynamically and skip past
+  // it. Falls back to 44 only if no "data" marker is found in the first
+  // bytes we read.
+  const asrPcmHeaderLenRef = useRef<number>(0);
   const liveAsrFormatRef = useRef<"pcm" | "none">("pcm");
 
   // Pipeline
@@ -655,6 +690,13 @@ export default function RecordScreen() {
   const [statusMsg, setStatusMsg] = useState("");
   const [resultSampleId, setResultSampleId] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Status-poll fallback: keeps the UI moving even when the WebSocket can't
+  // deliver progress events (e.g. WAF/ALB silently drops the upgraded socket,
+  // mobile network NAT closes the long-lived connection, etc.). Polls
+  // /encounters/{id}/status every few seconds until the pipeline reports
+  // complete / failed, or the safety cap is reached.
+  const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const statusPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Offline
   const { isOnline, enqueue, checkConnectivity } = useOfflineStore();
@@ -800,19 +842,48 @@ export default function RecordScreen() {
     }
   }, [patientQuery, allPatients]);
 
+  const stopStatusPolling = useCallback(() => {
+    if (statusPollRef.current) {
+      clearInterval(statusPollRef.current);
+      statusPollRef.current = null;
+    }
+    if (statusPollTimeoutRef.current) {
+      clearTimeout(statusPollTimeoutRef.current);
+      statusPollTimeoutRef.current = null;
+    }
+  }, []);
+
   // Cleanup
   useEffect(() => {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
       if (noteTimerRef.current) clearInterval(noteTimerRef.current);
       wsRef.current?.close();
+      stopStatusPolling();
       if (asrReadIntervalRef.current) clearInterval(asrReadIntervalRef.current);
       asrWsRef.current?.close();
     };
-  }, []);
+  }, [stopStatusPolling]);
 
   // ---- Recording ----
+  const ensureProviderAndPatient = (): boolean => {
+    // Defense in depth: even though the Record / Upload buttons are visually
+    // disabled until provider + patient are set, guard the actual functions
+    // too. Prevents a recording from starting with empty demographics that
+    // would later fail upload (provider_name is required by the pipeline).
+    if (!providerId) {
+      Alert.alert("Select a provider", "Please select a provider before recording.");
+      return false;
+    }
+    if (!selectedPatient) {
+      Alert.alert("Select a patient", "Please select a patient before recording.");
+      return false;
+    }
+    return true;
+  };
+
   const startRecording = async () => {
+    if (!ensureProviderAndPatient()) return;
     try {
       const existingPerm = await Audio.getPermissionsAsync();
       let justGrantedNow = false;
@@ -929,6 +1000,7 @@ export default function RecordScreen() {
   };
 
   const pickAudioFile = async () => {
+    if (!ensureProviderAndPatient()) return;
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: "audio/*",
@@ -1061,13 +1133,21 @@ export default function RecordScreen() {
         asrReadOffsetRef.current = 0;
         asrChunksSentRef.current = 0;
         asrPcmHeaderSkippedRef.current = false;
+        asrPcmHeaderLenRef.current = 0;
         setAsrError(null);
         setAsrStatus("Connected. Listening...");
+        console.log("[ASR] WS open — recording uri:", recordingUri);
         fetch(`${base}/asr/preload?mode=${encodeURIComponent(wsMode)}`, {
           method: "POST",
           headers: key ? { Authorization: `Bearer ${key}` } : {},
         }).catch(() => {});
 
+        // Polling cadence:
+        //   - Tighter interval (300 ms) catches iOS flushes sooner, which
+        //     keeps perceived latency low and avoids large monolithic chunks.
+        //   - On iOS, AVAudioRecorder may not flush PCM bytes to disk
+        //     instantly; if the file still reports size 0, we just no-op and
+        //     try again — the next flush will pick up everything new.
         asrReadIntervalRef.current = setInterval(async () => {
           try {
             const info = (await FileSystem.getInfoAsync(recordingUri, { size: true } as any)) as any;
@@ -1081,34 +1161,61 @@ export default function RecordScreen() {
             } as any);
             if (!b64) return;
             let bytes = base64ToUint8Array(b64);
+
             if (!asrPcmHeaderSkippedRef.current) {
-              // WAV carries a 44-byte header; ASR format=pcm expects raw s16le data.
-              const skip = Math.max(0, 44 - offset);
-              if (skip >= bytes.byteLength) return;
-              bytes = bytes.slice(skip);
+              // Locate the WAV "data" chunk dynamically — header length on
+              // iOS varies (44 / 46 / 60 / 78+ bytes depending on options).
+              // Without this, the first few audio "samples" we send are
+              // actually stale header bytes, which makes the ASR engine
+              // emit nothing for the opening seconds of the recording.
+              const dataOffset = findWavDataOffset(bytes);
+              if (dataOffset < 0) {
+                // Header didn't fully arrive yet — wait for next poll.
+                console.log("[ASR] waiting for WAV data chunk; have", bytes.byteLength, "bytes so far");
+                return;
+              }
+              asrPcmHeaderLenRef.current = dataOffset;
+              bytes = bytes.slice(dataOffset);
               asrPcmHeaderSkippedRef.current = true;
+              console.log("[ASR] WAV header parsed: data chunk starts at byte", dataOffset);
             }
+
             if (bytes.byteLength > 0 && asrWsRef.current?.readyState === WebSocket.OPEN) {
               const payload = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
               asrWsRef.current.send(payload);
               asrReadOffsetRef.current = size;
               asrChunksSentRef.current += 1;
+              if (asrChunksSentRef.current === 1 || asrChunksSentRef.current % 10 === 0) {
+                console.log(
+                  "[ASR] sent chunk",
+                  asrChunksSentRef.current,
+                  `(${bytes.byteLength} B, total file size ${size} B)`,
+                );
+              }
               setAsrStatus("Transcribing...");
             }
-          } catch {
-            // Keep recording flow stable even if ASR chunk read fails.
+          } catch (err) {
+            console.warn("[ASR] read/send error:", err);
           }
-        }, 1200);
+        }, 300);
 
+        // Watchdog: if iOS hasn't flushed any audio to disk after ~15 s, warn
+        // the user. The previous 6 s threshold was too aggressive — real
+        // first-flushes on iOS can take 8–12 s on cold starts.
         setTimeout(() => {
           if (asrChunksSentRef.current === 0 && asrWsRef.current?.readyState === WebSocket.OPEN) {
+            console.warn("[ASR] no audio chunks sent after 15s — file may not be flushing on this device");
             setAsrError("Live ASR connected but no audio chunks detected yet.");
           }
-        }, 6000);
+        }, 15000);
       };
       ws.onmessage = (event) => {
         try {
-          const data = JSON.parse(String(event.data));
+          const raw = String(event.data);
+          if (asrChunksSentRef.current <= 5) {
+            console.log("[ASR] WS←", raw.slice(0, 240));
+          }
+          const data = JSON.parse(raw);
           const eventType = String(data.type || "").toLowerCase();
           const text = String(data.text || "").trim();
           const partial = String(data.partial || "").trim();
@@ -1139,13 +1246,43 @@ export default function RecordScreen() {
           if (msg) setAsrPartialText(msg);
         }
       };
-      ws.onerror = () => setAsrError("Live transcription connection error");
-      ws.onclose = () => {
+      // Track close info so we can surface a precise on-screen diagnostic
+      // (Release builds skip Metro, so console.log isn't visible without
+      // an Xcode/devicectl log session — the screen text is the most
+      // reliable channel for the QA loop).
+      const wsHost = (() => {
+        try {
+          const u = wsUrl.replace(/^ws/, "http");
+          return new URL(u).host;
+        } catch {
+          return "ws://?";
+        }
+      })();
+      ws.onerror = (ev) => {
+        const m = (ev as any)?.message;
+        console.warn("[ASR] WS error", ev);
+        setAsrError(`Live transcription connection error (${wsHost}${m ? `: ${m}` : ""})`);
+      };
+      ws.onclose = (ev) => {
+        const code = (ev as any)?.code;
+        const reason = (ev as any)?.reason;
+        console.log("[ASR] WS close", code, reason);
+        // If we never received the "connected" frame, surface the close
+        // code/reason directly on screen — that's the single best signal
+        // for whether iOS rejected the handshake (TLS / ATS), the server
+        // rejected the upgrade (auth / WAF), or the connection died
+        // mid-stream (idle timeout / NAT).
+        if (asrChunksSentRef.current === 0) {
+          const detail = `code=${code ?? "?"}${reason ? ` ${reason}` : ""}`;
+          setAsrError(`Live transcription closed before audio (${wsHost} ${detail})`);
+        }
         setAsrStreaming(false);
         setAsrStatus("");
       };
-    } catch {
-      setAsrError("Unable to start live transcription");
+    } catch (err) {
+      console.warn("[ASR] start failed:", err);
+      const msg = err instanceof Error ? err.message : String(err);
+      setAsrError(`Unable to start live transcription: ${msg}`);
     }
   };
 
@@ -1277,10 +1414,12 @@ export default function RecordScreen() {
           setProgress(100);
           setStatusMsg("Pipeline complete — note generated");
           setResultSampleId(data.sample_id ?? null);
+          stopStatusPolling();
           ws.close();
         } else if (data.type === "error") {
           setStage("error");
           setStatusMsg(data.error ?? "Pipeline error");
+          stopStatusPolling();
           ws.close();
         }
       };
@@ -1307,9 +1446,49 @@ export default function RecordScreen() {
       setStatusMsg(result.message ?? "Pipeline running...");
       setResultSampleId(result.sample_id);
       setProgress(10);
+
+      // Start polling fallback. Even if every WS message is dropped between
+      // the device and the server (AWS WAF / ALB idle timeout / mobile NAT /
+      // RN WebSocket quirks), the pipeline still completes on the backend.
+      // Polling /encounters/{id}/status guarantees the UI flips to "complete"
+      // once the server says so, instead of sitting on "Audio received —
+      // pipeline running" forever.
+      stopStatusPolling();
+      const pollStartedAt = Date.now();
+      const POLL_INTERVAL_MS = 4000;
+      const POLL_MAX_MS = 15 * 60 * 1000; // safety cap: 15 minutes
+      statusPollRef.current = setInterval(async () => {
+        try {
+          const s = await fetchEncounterStatus(effectiveEncounterId);
+          const normalized = (s.status || "").toLowerCase();
+          if (normalized === "complete") {
+            setStage("complete");
+            setProgress(100);
+            setStatusMsg("Pipeline complete — note generated");
+            setResultSampleId(s.sample_id ?? null);
+            stopStatusPolling();
+            wsRef.current?.close();
+          } else if (normalized === "error" || normalized === "failed") {
+            setStage("error");
+            setStatusMsg(s.message || "Pipeline error");
+            stopStatusPolling();
+            wsRef.current?.close();
+          } else if (Date.now() - pollStartedAt > POLL_MAX_MS) {
+            stopStatusPolling();
+          }
+        } catch {
+          // Transient poll failures (offline blip, 5xx) shouldn't kill the
+          // poller — the next tick will retry. Hard-stop only on the
+          // overall time cap above.
+        }
+      }, POLL_INTERVAL_MS);
+      statusPollTimeoutRef.current = setTimeout(stopStatusPolling, POLL_MAX_MS);
     } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      // Surfaces in the Metro terminal when debugging on device (npx expo start).
+      console.error("[submit]", message, err);
       setStage("error");
-      setStatusMsg(err instanceof Error ? err.message : "Unknown error");
+      setStatusMsg(message);
     }
   }, [
     providerId,
@@ -1387,6 +1566,7 @@ export default function RecordScreen() {
     setPatientQuery("");
     discardRecording();
     wsRef.current?.close();
+    stopStatusPolling();
   };
 
   // ---- Render ----
@@ -1721,41 +1901,79 @@ export default function RecordScreen() {
         {!recordingUri ? (
           <View style={styles.recordSection}>
             <View style={{ flex: 1 }}>
-              <TouchableOpacity
-                style={[styles.recordBtn, stage === "recording" && styles.recordBtnActive]}
-                onPress={stage === "recording" ? stopRecording : startRecording}
-                disabled={stage !== "idle" && stage !== "recording"}
-              >
-                <Ionicons
-                  name={stage === "recording" ? "stop" : "mic"}
-                  size={32}
-                  color={colors.textInverse}
-                />
-              </TouchableOpacity>
-              <View style={{ marginTop: spacing.sm }}>
-                {stage === "recording" ? (
+              {(() => {
+                // Recording is only meaningful with a provider + patient picked
+                // (the pipeline rejects uploads with empty provider_name and
+                // the resulting note would be unattributable). Block start at
+                // the UI level; ensureProviderAndPatient() is the fallback.
+                const isRecording = stage === "recording";
+                const prereqsMet = Boolean(providerId && selectedPatient);
+                const recordDisabled =
+                  isRecording ? false : !prereqsMet || (stage !== "idle");
+                return (
                   <>
-                    <View style={styles.row}>
-                      <View style={styles.pulseDot} />
-                      <Text style={[styles.recordingLabel, { color: colors.error }]}>Recording...</Text>
+                    <TouchableOpacity
+                      style={[
+                        styles.recordBtn,
+                        isRecording && styles.recordBtnActive,
+                        recordDisabled && styles.recordBtnDisabled,
+                      ]}
+                      onPress={isRecording ? stopRecording : startRecording}
+                      disabled={recordDisabled}
+                    >
+                      <Ionicons
+                        name={isRecording ? "stop" : "mic"}
+                        size={32}
+                        color={colors.textInverse}
+                      />
+                    </TouchableOpacity>
+                    <View style={{ marginTop: spacing.sm }}>
+                      {isRecording ? (
+                        <>
+                          <View style={styles.row}>
+                            <View style={styles.pulseDot} />
+                            <Text style={[styles.recordingLabel, { color: colors.error }]}>
+                              Recording...
+                            </Text>
+                          </View>
+                          <Text style={styles.timer}>{formatTime(duration)}</Text>
+                        </>
+                      ) : prereqsMet ? (
+                        <Text style={styles.tapToRecord}>Tap to start recording</Text>
+                      ) : (
+                        <Text style={styles.tapToRecord}>
+                          {!providerId
+                            ? "Select a provider to start recording"
+                            : "Select a patient to start recording"}
+                        </Text>
+                      )}
                     </View>
-                    <Text style={styles.timer}>{formatTime(duration)}</Text>
                   </>
-                ) : (
-                  <Text style={styles.tapToRecord}>Tap to start recording</Text>
-                )}
-              </View>
+                );
+              })()}
             </View>
             <View style={{ marginLeft: spacing.md }}>
-              <TouchableOpacity
-                style={styles.uploadBtn}
-                onPress={pickAudioFile}
-                disabled={stage === "recording"}
-              >
-                <Ionicons name="cloud-upload-outline" size={16} color={colors.text} />
-                <Text style={styles.uploadBtnText}>Upload Audio</Text>
-              </TouchableOpacity>
-              <Text style={styles.uploadHint}>Use an existing audio file</Text>
+              {(() => {
+                const prereqsMet = Boolean(providerId && selectedPatient);
+                const uploadDisabled = stage === "recording" || !prereqsMet;
+                return (
+                  <>
+                    <TouchableOpacity
+                      style={[styles.uploadBtn, uploadDisabled && styles.uploadBtnDisabled]}
+                      onPress={pickAudioFile}
+                      disabled={uploadDisabled}
+                    >
+                      <Ionicons name="cloud-upload-outline" size={16} color={colors.text} />
+                      <Text style={styles.uploadBtnText}>Upload Audio</Text>
+                    </TouchableOpacity>
+                    <Text style={styles.uploadHint}>
+                      {prereqsMet
+                        ? "Use an existing audio file"
+                        : "Select provider & patient first"}
+                    </Text>
+                  </>
+                );
+              })()}
             </View>
           </View>
         ) : (
@@ -2283,6 +2501,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   recordBtnActive: { backgroundColor: colors.error },
+  recordBtnDisabled: { backgroundColor: colors.border, opacity: 0.6 },
   pulseDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.error, marginRight: spacing.sm },
   recordingLabel: { fontSize: fontSize.sm, fontWeight: "600" },
   timer: { fontSize: fontSize.xxl, fontWeight: "700", fontVariant: ["tabular-nums"], color: colors.text, marginTop: 2 },
@@ -2303,6 +2522,7 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontWeight: "600",
   },
+  uploadBtnDisabled: { opacity: 0.5 },
   uploadHint: {
     marginTop: spacing.xs,
     fontSize: fontSize.xs,

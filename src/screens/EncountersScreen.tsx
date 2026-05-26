@@ -14,6 +14,7 @@ import {
   Modal,
   ActivityIndicator,
 } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -24,6 +25,17 @@ import { fetchSamples, type SampleSummary, type ProviderSummary } from "../lib/a
 import { useSettings } from "../store/settings";
 import { useProviders } from "../store/providers";
 import { formatDateUS } from "../lib/date";
+
+// Persistent cache so a cold-start SOAP Notes tab paints the list instantly
+// from disk (the prod /encounters endpoint currently takes ~4.5 s — far too
+// long to leave the user staring at a spinner before showing anything).
+// Bumped to v2 when the bypass/throttle behaviour around it changed.
+const SAMPLES_CACHE_KEY = "soapNotes.samples.cache.v2";
+// Skip re-fetching when the existing list was loaded within this window.
+// Navigation between tabs would otherwise refire a 4.5 s request even though
+// nothing has plausibly changed (the underlying notes are pipeline-generated
+// and don't update second-by-second).
+const REFETCH_MIN_INTERVAL_MS = 60_000;
 
 function toTitleCase(value: string): string {
   return value
@@ -92,45 +104,107 @@ export default function EncountersScreen() {
   // full-screen spinner on re-focus / pull-to-refresh so the existing list
   // stays visible.
   const hasLoadedSamplesOnce = useRef(false);
+  // Last successful fetch timestamp; used to throttle the focus-effect so we
+  // don't refire the slow /encounters request on every tab switch.
+  const lastFetchAtRef = useRef<number>(0);
+  // Prevents concurrent fetches from racing each other (focus + pull + url
+  // change can otherwise all kick off at once on a cold open).
+  const inflightRef = useRef<Promise<void> | null>(null);
 
-  const loadData = useCallback(async () => {
-    if (!hasLoadedSamplesOnce.current) setIsLoading(true);
+  // On mount, hydrate the list immediately from AsyncStorage so the user
+  // sees something within ~50 ms even on a cold start, instead of a
+  // 4.5 s blank spinner.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(SAMPLES_CACHE_KEY);
+        if (!raw || cancelled) return;
+        const parsed = JSON.parse(raw) as { savedAt: number; items: SampleSummary[] };
+        if (!Array.isArray(parsed.items) || parsed.items.length === 0) return;
+        // Only paint the cache if we haven't already loaded fresh data.
+        if (!hasLoadedSamplesOnce.current) {
+          setSamples(parsed.items);
+          setIsLoading(false);
+        }
+      } catch {
+        // Cache corrupt or missing — fall back to the normal fetch path.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-    // Kick off (or no-op) a providers refresh in the background for the
-    // currently selected Eclipse location. We don't block the SOAP notes UI
-    // on it — the dropdown will hydrate from the store whenever the load
-    // resolves.
-    void loadProviders(eclipseLocation).catch(() => {});
+  const loadData = useCallback(
+    async (opts?: { force?: boolean }) => {
+      const force = opts?.force === true;
+      // Throttle: if a fresh load happened within the last minute and the
+      // caller didn't explicitly force, skip — keeps tab switches snappy.
+      if (
+        !force &&
+        hasLoadedSamplesOnce.current &&
+        Date.now() - lastFetchAtRef.current < REFETCH_MIN_INTERVAL_MS
+      ) {
+        return;
+      }
+      // Coalesce concurrent calls (focus + mount + apiUrl change).
+      if (inflightRef.current) {
+        return inflightRef.current;
+      }
 
-    try {
-      const list = await fetchSamples();
-      setSamples(list);
-      setSamplesError(null);
-      hasLoadedSamplesOnce.current = true;
-    } catch (err) {
-      // CRITICAL: do NOT wipe `samples` on error. Surface the error but keep
-      // showing the last successful list so a network blip never silently
-      // turns into an empty "0 SOAP notes" screen.
-      console.warn("Failed to load encounters", err);
-      setSamplesError(err instanceof Error ? err.message : "Failed to load SOAP notes");
-    } finally {
-      setIsLoading(false);
-    }
-  }, [loadProviders, eclipseLocation]);
+      if (!hasLoadedSamplesOnce.current) setIsLoading(true);
+
+      // Kick off (or no-op) a providers refresh in the background for the
+      // currently selected Eclipse location. We don't block the SOAP notes UI
+      // on it — the dropdown will hydrate from the store whenever the load
+      // resolves.
+      void loadProviders(eclipseLocation).catch(() => {});
+
+      const promise = (async () => {
+        try {
+          const list = await fetchSamples();
+          setSamples(list);
+          setSamplesError(null);
+          hasLoadedSamplesOnce.current = true;
+          lastFetchAtRef.current = Date.now();
+          // Persist to disk so a future cold start paints instantly.
+          AsyncStorage.setItem(
+            SAMPLES_CACHE_KEY,
+            JSON.stringify({ savedAt: Date.now(), items: list }),
+          ).catch(() => {});
+        } catch (err) {
+          // CRITICAL: do NOT wipe `samples` on error. Surface the error but
+          // keep showing the last successful list so a network blip never
+          // silently turns into an empty "0 SOAP notes" screen.
+          console.warn("Failed to load encounters", err);
+          setSamplesError(err instanceof Error ? err.message : "Failed to load SOAP notes");
+        } finally {
+          setIsLoading(false);
+          inflightRef.current = null;
+        }
+      })();
+      inflightRef.current = promise;
+      return promise;
+    },
+    [loadProviders, eclipseLocation],
+  );
 
   useEffect(() => {
-    loadData();
+    // URL change is a real "things might have moved" event — force.
+    void loadData({ force: true });
   }, [loadData, apiUrl]);
 
   useFocusEffect(
     useCallback(() => {
+      // Tab re-focus: only refire if stale; throttle handles it.
       void loadData();
     }, [loadData]),
   );
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await loadData().catch(() => {});
+    await loadData({ force: true }).catch(() => {});
     setRefreshing(false);
   };
 
@@ -215,30 +289,36 @@ export default function EncountersScreen() {
 
   const normalizedSearch = normalizeForSearch(search);
 
-  const filtered = sortedSamples.filter((s) => {
-    if (selectedProviderObj && !physicianMatchesProvider(s.physician, selectedProviderObj)) {
-      return false;
-    }
-    if (filterMode && s.mode !== filterMode) return false;
-    if (normalizedSearch) {
-      // Match against every field visible on the card: patient name (derived
-      // from the sample id), provider, mode, raw note id, and the formatted
-      // date of service.
-      const haystack = normalizeForSearch(
-        [
-          s.sample_id,
-          formatEncounterTitle(s.sample_id),
-          s.physician,
-          s.mode,
-          getDateFromSampleId(s.sample_id),
-        ]
-          .filter(Boolean)
-          .join(" "),
-      );
-      if (!haystack.includes(normalizedSearch)) return false;
-    }
-    return true;
-  });
+  // Memoize the filtered list so we only re-run the per-row regex /
+  // tokenization work when the inputs actually change. Previously this
+  // re-ran on every render (keyboard taps, focus, even pull-to-refresh),
+  // which compounded the perceived slowness on 200+ rows.
+  const filtered = useMemo(() => {
+    return sortedSamples.filter((s) => {
+      if (selectedProviderObj && !physicianMatchesProvider(s.physician, selectedProviderObj)) {
+        return false;
+      }
+      if (filterMode && s.mode !== filterMode) return false;
+      if (normalizedSearch) {
+        // Match against every field visible on the card: patient name (derived
+        // from the sample id), provider, mode, raw note id, and the formatted
+        // date of service.
+        const haystack = normalizeForSearch(
+          [
+            s.sample_id,
+            formatEncounterTitle(s.sample_id),
+            s.physician,
+            s.mode,
+            getDateFromSampleId(s.sample_id),
+          ]
+            .filter(Boolean)
+            .join(" "),
+        );
+        if (!haystack.includes(normalizedSearch)) return false;
+      }
+      return true;
+    });
+  }, [sortedSamples, selectedProviderObj, filterMode, normalizedSearch]);
 
   const scoreVariant = (score: number | null | undefined) => {
     if (score == null) return "neutral" as const;
@@ -465,7 +545,7 @@ export default function EncountersScreen() {
           <Text style={styles.errorBannerText} numberOfLines={2}>
             Couldn't refresh — showing last loaded list.
           </Text>
-          <TouchableOpacity onPress={() => void loadData()} hitSlop={8}>
+          <TouchableOpacity onPress={() => void loadData({ force: true })} hitSlop={8}>
             <Text style={styles.errorBannerRetry}>Retry</Text>
           </TouchableOpacity>
         </View>
@@ -479,6 +559,13 @@ export default function EncountersScreen() {
         key={numColumns}
         contentContainerStyle={[styles.listContent, isTablet && styles.tabletListContent]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.brand} />}
+        // Render-pass tuning: only paint the first screen on mount, then
+        // batch the rest. With 200+ rows this is the difference between a
+        // snappy paint and a half-second jank on tab focus.
+        initialNumToRender={8}
+        maxToRenderPerBatch={8}
+        windowSize={7}
+        removeClippedSubviews
         ListEmptyComponent={
           isLoading ? (
             <View style={styles.empty}>
