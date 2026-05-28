@@ -38,13 +38,18 @@ import {
   getWsUrl,
   ECLIPSE_LOCATION_LABEL,
   type EclipseLocation,
-  type ProviderSummary,
   type PatientSearchResult,
 } from "../lib/api";
 import { useSettings, getApiKey, getApiUrl } from "../store/settings";
 import { useOfflineStore } from "../store/offline";
 import { useAuthStore } from "../store/auth";
 import { useProviders } from "../store/providers";
+import {
+  getCachedPatients,
+  peekCachedPatients,
+  setCachedPatients,
+} from "../store/patientsCache";
+import { findProviderForUser } from "../lib/providerMatch";
 import { formatDateUS } from "../lib/date";
 
 const FRONTEND_PARITY_VISIT_TYPE = "follow_up";
@@ -210,76 +215,60 @@ function findClosestAppointment(
 
 // Tokenize a person's name for fuzzy matching: lowercase, strip honorifics
 // and credentials, drop punctuation, return word tokens.
-function tokensFromName(value: unknown): string[] {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/^(dr|mr|mrs|ms|miss|prof)\.?\s+/i, "")
-    .replace(/,\s*/g, " ")
-    .replace(/\b(md|do|phd|rn|np|pa|dds|dmd|esq|jr|sr|ii|iii|iv)\b/g, " ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+// findProviderForUser / tokensFromName moved to ../lib/providerMatch so the
+// background-prefetch logic in App.tsx can reuse the exact same matching
+// behavior without dragging in any screen-level state.
+
+/**
+ * Loading-state placeholder rows for the provider + patient pickers. The
+ * web version of this form arrives with both dropdowns pre-populated via
+ * SSR; on mobile we can't do that, but a couple of muted skeleton rows
+ * shaped like the real items make the wait feel much less broken than a
+ * single bare spinner.
+ */
+function SkeletonRow({ width }: { width: number }) {
+  return (
+    <View style={skeletonStyles.row}>
+      <View style={[skeletonStyles.bar, { width: `${width}%` }]} />
+      <View style={[skeletonStyles.barSm, { width: `${Math.max(20, width - 30)}%` }]} />
+    </View>
+  );
 }
 
-// Match the logged-in user against the provider list. Returns provider id
-// when there is a single confident match; otherwise null (caller leaves
-// selection empty so the user picks manually).
-function findProviderForUser(
-  providers: ProviderSummary[],
-  user: { name?: string | null; email?: string | null } | null | undefined,
-): string | null {
-  if (!user || providers.length === 0) return null;
-
-  // Handle "Last, First" by swapping order before tokenization.
-  const rawName = String(user.name ?? "").trim();
-  const swappedName = rawName.includes(",")
-    ? rawName
-        .split(",")
-        .map((s) => s.trim())
-        .reverse()
-        .join(" ")
-    : rawName;
-  const userTokens = tokensFromName(swappedName);
-
-  // 1. Exact match on joined normalized tokens.
-  if (userTokens.length > 0) {
-    const userJoined = userTokens.join(" ");
-    const exact = providers.find(
-      (p) => tokensFromName(p.name ?? p.id).join(" ") === userJoined,
-    );
-    if (exact) return exact.id;
-  }
-
-  // Token-subset matcher: every query token must be present in the provider's
-  // tokens. Requires at least 2 tokens to avoid false positives from a single
-  // common last name.
-  const subsetMatches = (queryTokens: string[]): ProviderSummary[] => {
-    if (queryTokens.length < 2) return [];
-    return providers.filter((p) => {
-      const set = new Set(tokensFromName(p.name ?? p.id));
-      return queryTokens.every((t) => set.has(t));
-    });
-  };
-
-  // 2. Subset match on display name (handles middle names/initials).
-  const nameMatches = subsetMatches(userTokens);
-  if (nameMatches.length === 1) return nameMatches[0].id;
-  if (nameMatches.length > 1) return null; // ambiguous → no selection
-
-  // 3. Fallback: email local-part tokens (e.g. caleb.ademiloye@…).
-  const email = String(user.email ?? "").trim().toLowerCase();
-  const localPart = email.includes("@") ? email.split("@")[0] : email;
-  const emailTokens = localPart
-    .replace(/[._\-+0-9]+/g, " ")
-    .trim()
-    .split(/\s+/)
-    .filter((t) => t.length >= 2);
-  const emailMatches = subsetMatches(emailTokens);
-  if (emailMatches.length === 1) return emailMatches[0].id;
-
-  return null;
+function SkeletonList({ count }: { count: number }) {
+  const widths = [85, 70, 78, 65, 80, 72];
+  return (
+    <View style={skeletonStyles.list}>
+      {Array.from({ length: count }).map((_, i) => (
+        <SkeletonRow key={i} width={widths[i % widths.length]} />
+      ))}
+    </View>
+  );
 }
+
+const skeletonStyles = StyleSheet.create({
+  list: {
+    marginTop: 8,
+    gap: 8,
+  },
+  row: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    backgroundColor: "rgba(0,0,0,0.02)",
+    borderRadius: 8,
+  },
+  bar: {
+    height: 10,
+    backgroundColor: "rgba(0,0,0,0.08)",
+    borderRadius: 4,
+    marginBottom: 6,
+  },
+  barSm: {
+    height: 8,
+    backgroundColor: "rgba(0,0,0,0.05)",
+    borderRadius: 4,
+  },
+});
 
 function base64ToUint8Array(base64: string): Uint8Array {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -759,54 +748,127 @@ export default function RecordScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providers, authUserName, authUserEmail]);
 
-  // Patient search — fetch once per provider/date, filter locally.
-  // A local `cancelled` flag prevents a late-arriving response from the
-  // previous provider/date/location from overwriting state after the user
-  // has switched selections.
+  // Patient search — fetch once per provider/date, filter locally. Now
+  // backed by the patientsCache so the picker paints **instantly** from
+  // memory / AsyncStorage when we've seen this (provider, date, location)
+  // combo before, then quietly refreshes in the background. A local
+  // `cancelled` flag prevents a late-arriving response from the previous
+  // provider/date/location from overwriting state after the user switches.
   useEffect(() => {
     setSelectedPatient(null);
     setPatientQuery("");
-    setPatients([]);
-    setAllPatients([]);
     setPatientLoadError(null);
-    setPatientsLoading(false);
+
     if (!providerId) {
+      setPatients([]);
+      setAllPatients([]);
+      setPatientsLoading(false);
       return;
     }
 
     let cancelled = false;
-    setPatientsLoading(true);
-    fetchPatientsByProviderDate(providerId, appointmentDate, "", eclipseLocation)
-      .then((list) => {
-        if (cancelled) return;
-        const sortedList = [...list].sort((a, b) =>
-          normalize(`${a.last_name} ${a.first_name}`).localeCompare(normalize(`${b.last_name} ${b.first_name}`)),
-        );
-        setAllPatients(sortedList);
-        setPatients(sortedList);
 
-        // Auto-select the patient whose appointment is closest to current
-        // ET time — only when viewing today's schedule. If no qualifying
-        // appointment is in range, leave selection empty for the clinician.
-        if (appointmentDate === getEtDateIso()) {
-          const best = findClosestAppointment(sortedList, getEtMinutesNow());
-          if (best) {
-            setSelectedPatient(best);
-          }
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setPatientLoadError(err instanceof Error ? err.message : "Failed to load patients");
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setPatientsLoading(false);
+    // 1) Synchronous in-memory peek — if we already loaded this combo in
+    //    this app session, paint immediately with zero awaits.
+    const memHit = peekCachedPatients(providerId, appointmentDate, eclipseLocation);
+    if (memHit && memHit.length > 0) {
+      setAllPatients(memHit);
+      setPatients(memHit);
+      setPatientsLoading(false);
+      if (appointmentDate === getEtDateIso()) {
+        const best = findClosestAppointment(memHit, getEtMinutesNow());
+        if (best) setSelectedPatient(best);
+      }
+    } else {
+      // No memory hit — clear stale rows and show the loading state. We may
+      // still get an AsyncStorage hit a few ms later that fills the list.
+      setPatients([]);
+      setAllPatients([]);
+      setPatientsLoading(true);
+    }
+
+    // Helper: apply a freshly resolved patient list to state + cache, with
+    // optional auto-select for today's schedule. Keeps the two callsites
+    // (cache hit, network refresh) DRY and consistent.
+    const applyList = (list: PatientSearchResult[], persist: boolean) => {
+      const sortedList = [...list].sort((a, b) =>
+        normalize(`${a.last_name} ${a.first_name}`).localeCompare(
+          normalize(`${b.last_name} ${b.first_name}`),
+        ),
+      );
+      if (persist) {
+        setCachedPatients(providerId, appointmentDate, eclipseLocation, sortedList);
+      }
+      if (cancelled) return;
+      setAllPatients(sortedList);
+      // Preserve the user's free-text filter across a background refresh.
+      setPatients((current) => {
+        if (current.length === 0) return sortedList;
+        // If we already had something rendered (cache hit), only update the
+        // full list — the typing-filter effect downstream will reapply the
+        // user's query against the new `allPatients`.
+        return sortedList;
       });
+      if (appointmentDate === getEtDateIso()) {
+        // Don't clobber a manual selection the user already made.
+        setSelectedPatient((existing) => {
+          if (existing) return existing;
+          return findClosestAppointment(sortedList, getEtMinutesNow()) ?? null;
+        });
+      }
+    };
+
+    (async () => {
+      // 2) AsyncStorage fallback — async but cheap (typically <30 ms).
+      //    Only paints when the mem peek above missed.
+      if (!memHit || memHit.length === 0) {
+        const disk = await getCachedPatients(
+          providerId,
+          appointmentDate,
+          eclipseLocation,
+        );
+        if (cancelled) return;
+        if (disk.status === "fresh" || disk.status === "stale") {
+          applyList(disk.patients, false);
+          setPatientsLoading(false);
+          // "fresh" cache hits skip the network refresh entirely.
+          if (disk.status === "fresh") return;
+        }
+      }
+
+      // 3) Background refresh from Eclipse. We always fire this when there
+      //    was no in-memory hit OR the disk cache was stale — guarantees
+      //    the list is eventually current even if it painted from cache.
+      try {
+        const list = await fetchPatientsByProviderDate(
+          providerId,
+          appointmentDate,
+          "",
+          eclipseLocation,
+        );
+        if (cancelled) return;
+        applyList(list, true);
+      } catch (err) {
+        if (cancelled) return;
+        // Only surface the error when we have nothing else to show. A
+        // background refresh failure that follows a cache paint should be
+        // silent — the cached data is still useful.
+        setPatientLoadError((prev) => {
+          if (allPatients.length > 0) return prev;
+          return err instanceof Error ? err.message : "Failed to load patients";
+        });
+      } finally {
+        if (!cancelled) setPatientsLoading(false);
+      }
+    })();
 
     return () => {
       cancelled = true;
     };
+    // allPatients is intentionally excluded from deps — including it would
+    // re-fire the network request every time the list updates (infinite
+    // loop). The effect should only re-run on the actual input keys.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providerId, appointmentDate, apiUrl, eclipseLocation]);
 
   // Local filtering when user types
@@ -1640,9 +1702,10 @@ export default function RecordScreen() {
       <Card>
         <Text style={styles.label}>Provider</Text>
         {!providersLoaded ? (
-          <Text style={styles.sublabel}>
-            Loading providers...
-          </Text>
+          <>
+            <Text style={styles.sublabel}>Loading providers...</Text>
+            <SkeletonList count={4} />
+          </>
         ) : providers.length === 0 ? (
           <Text style={styles.sublabel}>
             {providerLoadError ? `Unable to load providers: ${providerLoadError}` : "No providers found."}
@@ -1811,12 +1874,19 @@ export default function RecordScreen() {
                 placeholderTextColor={colors.textTertiary}
               />
             </View>
-            {patientsLoading && (
+            {/* While we're fetching AND have nothing rendered yet, show
+                skeleton rows instead of a bare spinner — same trick the web
+                achieves by SSR-populating the dropdown before paint. Once
+                cached/fresh data is on screen we keep the spinner-style
+                hint subtle so a background refresh doesn't flash the UI. */}
+            {patientsLoading && patients.length === 0 ? (
+              <SkeletonList count={5} />
+            ) : patientsLoading ? (
               <View style={styles.patientLoadingRow}>
                 <ActivityIndicator size="small" color={colors.brand} />
-                <Text style={styles.patientLoadingText}>Loading patients for selected provider...</Text>
+                <Text style={styles.patientLoadingText}>Refreshing patient list…</Text>
               </View>
-            )}
+            ) : null}
             <FlatList
               data={patients}
               keyExtractor={(p) => p.id}
@@ -1834,13 +1904,15 @@ export default function RecordScreen() {
                 </TouchableOpacity>
               )}
               ListEmptyComponent={
-                <Text style={styles.sublabel}>
-                  {patientsLoading
-                    ? "Loading patients..."
-                    : patientLoadError
-                    ? `Unable to load patients: ${patientLoadError}`
-                    : "No patients found. Try adjusting your search."}
-                </Text>
+                patientsLoading
+                  ? null
+                  : (
+                    <Text style={styles.sublabel}>
+                      {patientLoadError
+                        ? `Unable to load patients: ${patientLoadError}`
+                        : "No patients found. Try adjusting your search."}
+                    </Text>
+                  )
               }
             />
           </>

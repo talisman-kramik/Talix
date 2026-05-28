@@ -14,7 +14,6 @@ import {
   Modal,
   ActivityIndicator,
 } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -24,13 +23,13 @@ import { colors, fontSize, spacing, radius } from "../lib/theme";
 import { fetchSamples, type SampleSummary, type ProviderSummary } from "../lib/api";
 import { useSettings } from "../store/settings";
 import { useProviders } from "../store/providers";
+import { getCachedSamples, setCachedSamples } from "../store/samplesCache";
 import { formatDateUS } from "../lib/date";
 
-// Persistent cache so a cold-start SOAP Notes tab paints the list instantly
-// from disk (the prod /encounters endpoint currently takes ~4.5 s — far too
-// long to leave the user staring at a spinner before showing anything).
-// Bumped to v2 when the bypass/throttle behaviour around it changed.
-const SAMPLES_CACHE_KEY = "soapNotes.samples.cache.v2";
+// Cold-start SOAP Notes tab paints the cached list within ~50 ms instead of
+// waiting ~4.5 s for the prod /encounters endpoint. Cache key + helpers
+// live in ../store/samplesCache so the App-level login warmup can prefetch
+// into the same slot.
 // Skip re-fetching when the existing list was loaded within this window.
 // Navigation between tabs would otherwise refire a 4.5 s request even though
 // nothing has plausibly changed (the underlying notes are pipeline-generated
@@ -117,18 +116,11 @@ export default function EncountersScreen() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      try {
-        const raw = await AsyncStorage.getItem(SAMPLES_CACHE_KEY);
-        if (!raw || cancelled) return;
-        const parsed = JSON.parse(raw) as { savedAt: number; items: SampleSummary[] };
-        if (!Array.isArray(parsed.items) || parsed.items.length === 0) return;
-        // Only paint the cache if we haven't already loaded fresh data.
-        if (!hasLoadedSamplesOnce.current) {
-          setSamples(parsed.items);
-          setIsLoading(false);
-        }
-      } catch {
-        // Cache corrupt or missing — fall back to the normal fetch path.
+      const cached = await getCachedSamples();
+      if (cancelled || !cached || cached.items.length === 0) return;
+      if (!hasLoadedSamplesOnce.current) {
+        setSamples(cached.items);
+        setIsLoading(false);
       }
     })();
     return () => {
@@ -168,11 +160,7 @@ export default function EncountersScreen() {
           setSamplesError(null);
           hasLoadedSamplesOnce.current = true;
           lastFetchAtRef.current = Date.now();
-          // Persist to disk so a future cold start paints instantly.
-          AsyncStorage.setItem(
-            SAMPLES_CACHE_KEY,
-            JSON.stringify({ savedAt: Date.now(), items: list }),
-          ).catch(() => {});
+          setCachedSamples(list);
         } catch (err) {
           // CRITICAL: do NOT wipe `samples` on error. Surface the error but
           // keep showing the last successful list so a network blip never

@@ -395,9 +395,12 @@ export const ECLIPSE_LOCATION_LABEL: Record<EclipseLocation, string> = {
 };
 
 // Provider list changes infrequently (new providers added at human speed,
-// not minute-by-minute). 15 minutes keeps the dropdown snappy across screen
-// changes without serving stale data for long.
-const ECLIPSE_ROWS_TTL_MS = 15 * 60 * 1000; // 15 minutes
+// not minute-by-minute). 24 h matches the providers-store freshness window
+// so we don't pay a 6–16 s foreground Eclipse round-trip every time the
+// user resumes the app from a coffee break. Truly fresh data still arrives
+// via the next loadProviders() call after 24 h, and any force=true call
+// (pull-to-refresh) bypasses this entirely.
+const ECLIPSE_ROWS_TTL_MS = 24 * 60 * 60 * 1000;
 // v3: provider ids now embed `appointment_provider_id` when available so
 // patient lookups can filter by id instead of brittle name-string matching.
 const ECLIPSE_PROVIDERS_CACHE_KEY_PREFIX = "talix.eclipse.providers.v3";

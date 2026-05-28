@@ -29,6 +29,18 @@ import { useSettings } from "./src/store/settings";
 import { useOfflineStore } from "./src/store/offline";
 import { useAuthStore } from "./src/store/auth";
 import { useProviders } from "./src/store/providers";
+import {
+  getCachedPatients,
+  setCachedPatients,
+} from "./src/store/patientsCache";
+import { setCachedSamples } from "./src/store/samplesCache";
+import { findProviderForUser } from "./src/lib/providerMatch";
+import {
+  fetchPatientsByProviderDate,
+  fetchProviders,
+  fetchSamples,
+  type EclipseLocation,
+} from "./src/lib/api";
 
 const EncounterStack = createNativeStackNavigator();
 
@@ -145,16 +157,105 @@ export default function App() {
     }
   }, [isAuthenticated, isRestoredSession]);
 
-  // Pre-warm the providers list as soon as the user is authenticated, so the
-  // Record / SOAP Notes screens don't pay the 6-9s Eclipse round-trip on their
-  // first mount. Re-warms on location switch (PA ↔ Baltimore) so each location
-  // has its own fresh-or-cached list ready. Failures are swallowed — each
-  // screen still surfaces its own error UI.
+  // Pre-warm the providers store for the currently selected location so the
+  // Record / SOAP Notes screens don't pay the Eclipse round-trip on first
+  // mount. Re-warms on location switch (PA ↔ Baltimore). Failures are
+  // swallowed — each screen still surfaces its own error UI.
   const eclipseLocation = useSettings((s) => s.eclipseLocation);
+  useEffect(() => {
+    // Hydration from disk runs on every location change AND on cold start.
+    // We persist each location's snapshot separately (PA + Baltimore live
+    // in their own AsyncStorage keys) so flipping between them paints the
+    // dropdown instantly from cache while the background Eclipse refresh
+    // runs in parallel — never blank, never spinner.
+    useProviders.getState().hydrateFromCache(eclipseLocation).catch(() => {});
+  }, [eclipseLocation]);
   useEffect(() => {
     if (!isAuthenticated) return;
     useProviders.getState().loadProviders(eclipseLocation).catch(() => {});
   }, [isAuthenticated, eclipseLocation]);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Login warmup: parallel background prefetch of *everything* the user
+  // is likely to look at in the next minute. By the time they tap any
+  // tab, the data is already on disk + in memory.
+  //
+  // Mirrors the manager's spec: as soon as the app starts, fire all the
+  // slow APIs in parallel:
+  //   1. PA providers
+  //   2. Baltimore providers
+  //   3. For each location's auto-matched provider, that provider's
+  //      patient list for today
+  //   4. SOAP Notes list (the slow /encounters endpoint)
+  //
+  // All requests are fire-and-forget; failures are silent because each
+  // screen still does its own real fetch with proper error UI. The
+  // underlying api.ts already has per-location dedupe so a request that's
+  // already in flight from the store-level loadProviders() call won't
+  // duplicate.
+  // ─────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isAuthenticated || !user) return;
+    let cancelled = false;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const userIdentity = {
+      name: user.name ?? null,
+      email: user.email ?? null,
+    };
+
+    // Helper: for a given location, fetch providers, then auto-match the
+    // logged-in clinician, then prefetch their patient list for today.
+    // Returns immediately; runs asynchronously in the background.
+    const warmLocation = async (location: EclipseLocation) => {
+      try {
+        const providers = await fetchProviders(location);
+        if (cancelled) return;
+        const matchedId = findProviderForUser(providers, userIdentity);
+        if (!matchedId) return;
+        const cached = await getCachedPatients(matchedId, today, location);
+        if (cancelled) return;
+        if (cached.status === "fresh") return; // already warm
+        const list = await fetchPatientsByProviderDate(
+          matchedId,
+          today,
+          "",
+          location,
+        );
+        if (cancelled) return;
+        setCachedPatients(matchedId, today, location, list);
+      } catch {
+        // Best-effort warmup — let the screen-level fetch surface real errors.
+      }
+    };
+
+    // SOAP Notes warmup. The /encounters endpoint is currently ~4.5 s on
+    // prod; warming it at login means the SOAP Notes tab paints instantly
+    // when the user first opens it. EncountersScreen also hydrates from
+    // the same cache key, so the moment the network response lands here
+    // the next tab visit is a free render.
+    const warmSamples = async () => {
+      try {
+        const list = await fetchSamples();
+        if (cancelled) return;
+        setCachedSamples(list);
+      } catch {
+        // Silent — the SOAP Notes tab still does its own fetch.
+      }
+    };
+
+    // Fire all three in parallel. PA + Baltimore + SOAP Notes go out
+    // simultaneously; the network and the JS thread are both happy doing
+    // this concurrently because each request is just sitting on its own
+    // socket waiting for the slow Eclipse / API response.
+    void warmLocation("pennsylvania");
+    void warmLocation("baltimore");
+    void warmSamples();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, user]);
 
   // ── Loading splash ────────────────────────────────────────────────────
   if (!loadedSettings || loadingAuth) {
