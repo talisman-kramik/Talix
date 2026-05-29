@@ -5,7 +5,11 @@
 import { create } from "zustand";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Network from "expo-network";
-import { createEncounter, uploadEncounterAudio } from "../lib/api";
+import {
+  createEncounter,
+  uploadEncounterAudio,
+  type EncounterDemographics,
+} from "../lib/api";
 
 const QUEUE_KEY = "ai_scribe_offline_queue";
 
@@ -20,6 +24,11 @@ export interface QueuedEncounter {
   createdAt: string;
   status: "queued" | "uploading" | "failed";
   error?: string;
+  /** Demographics blob delivered alongside the audio. The AI Scribe
+   *  pipeline branches on `system_location` for SFTP / MT folder routing,
+   *  so we persist it with the queued item so a deferred upload routes the
+   *  same way an immediate one would. */
+  demographics?: EncounterDemographics;
 }
 
 interface OfflineState {
@@ -78,7 +87,14 @@ export const useOfflineStore = create<OfflineState>((set, get) => ({
           visit_type: item.visit_type,
           mode: item.mode,
         });
-        await uploadEncounterAudio(enc.encounter_id, item.audioUri, item.filename);
+        await uploadEncounterAudio(
+          enc.encounter_id,
+          item.audioUri,
+          item.filename,
+          null,
+          null,
+          item.demographics,
+        );
         get().remove(item.id);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : "Upload failed";

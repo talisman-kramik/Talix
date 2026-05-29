@@ -34,6 +34,7 @@ import {
   createEncounter,
   resolveEncounterProviderId,
   uploadEncounterAudio,
+  buildEncounterDetails,
   fetchEncounterStatus,
   getWsUrl,
   ECLIPSE_LOCATION_LABEL,
@@ -70,6 +71,23 @@ function getPatientDisplayName(patient: Pick<PatientSearchResult, "first_name" |
   if (fullName) return fullName;
   if (patient.mrn) return `MRN: ${patient.mrn}`;
   return patient.id;
+}
+
+/**
+ * Normalise a DOB value to `YYYY-MM-DD`. Eclipse hands us back ISO strings
+ * (`2008-04-19T00:00:00Z`), bare dates (`2008-04-19`), and occasional
+ * locale-formatted strings; the backend pipeline expects YYYY-MM-DD for
+ * SFTP folder naming. Anything we can't parse passes through unchanged so
+ * we never block an upload on a date format we don't recognise.
+ */
+function toIsoDate(value: string | undefined | null): string {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.toLowerCase() === "unknown") return "";
+  const direct = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (direct) return direct[1];
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return raw;
+  return parsed.toISOString().slice(0, 10);
 }
 
 function getTodayDateIso(): string {
@@ -1496,12 +1514,38 @@ export default function RecordScreen() {
       setStatusMsg("Uploading audio...");
       setProgress(5);
 
+      // Build the demographics blob the AI Scribe pipeline relies on to
+      // route uploads to the correct SFTP / MT folders and to slug the
+      // generated note. Without this the backend can't distinguish a
+      // Pennsylvania run from a Baltimore one — the web app sends the same
+      // payload via its capture flow.
+      const demographics = buildEncounterDetails({
+        providerName: selectedProviderName || patientNameForRequest || "Unknown",
+        patientName: patientNameForRequest || getPatientDisplayName(selectedPatient),
+        patientDob: toIsoDate(selectedPatient.date_of_birth),
+        accountNumber:
+          String(selectedPatient.mrn || "").trim() ||
+          String(selectedPatient.patient_case_id || "").trim(),
+        caseName: String(selectedPatient.patient_case_id || "").trim(),
+        // Prefer the actual office name from Eclipse (e.g. "West
+        // Philadelphia") when present; fall back to the human label of the
+        // selected system ("Pennsylvania" / "Baltimore") so the field is
+        // never empty.
+        locationName:
+          String(selectedPatient.location || "").trim() ||
+          ECLIPSE_LOCATION_LABEL[eclipseLocation],
+        // Lowercase identifier the backend keys off — "pennsylvania" or
+        // "baltimore". Matches the same string the web sends.
+        systemLocation: eclipseLocation,
+      });
+
       const result = await uploadEncounterAudio(
         effectiveEncounterId,
         recordingUri,
         audioFilename,
         effectiveNoteAudioUri,
         effectiveNoteAudioFilename,
+        demographics,
       );
 
       setStage("processing");
