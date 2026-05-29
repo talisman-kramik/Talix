@@ -33,3 +33,38 @@ jest.mock('@expo/vector-icons', () => {
     Ionicons: (props) => React.createElement(View, { testID: 'mock-icon' }),
   };
 });
+
+// Mock expo-av — the native ExponentAV module is unavailable in the jest env.
+// Tests only need the surface area used by `useAmendVoiceRecorder`.
+jest.mock('expo-av', () => ({
+  Audio: {
+    requestPermissionsAsync: jest.fn(() => Promise.resolve({ granted: true })),
+    setAudioModeAsync: jest.fn(() => Promise.resolve()),
+    Recording: {
+      createAsync: jest.fn(() =>
+        Promise.resolve({
+          recording: {
+            stopAndUnloadAsync: jest.fn(() => Promise.resolve()),
+            getURI: jest.fn(() => 'file:///mock/recording.m4a'),
+          },
+        }),
+      ),
+    },
+    Sound: {
+      createAsync: jest.fn(() =>
+        Promise.resolve({
+          sound: {
+            unloadAsync: jest.fn(() => Promise.resolve()),
+            playAsync: jest.fn(() => Promise.resolve()),
+            pauseAsync: jest.fn(() => Promise.resolve()),
+            setPositionAsync: jest.fn(() => Promise.resolve()),
+            getStatusAsync: jest.fn(() =>
+              Promise.resolve({ isLoaded: true, isPlaying: false, positionMillis: 0, durationMillis: 0 }),
+            ),
+          },
+        }),
+      ),
+    },
+    RecordingOptionsPresets: { HIGH_QUALITY: {} },
+  },
+}));

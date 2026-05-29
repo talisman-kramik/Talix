@@ -10,13 +10,16 @@
  *   3. SOAP Note (id, mode, quality)
  *   4. Markdown body
  */
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
   StyleSheet,
   ScrollView,
   ActivityIndicator,
+  Pressable,
+  Keyboard,
+  Platform,
   useWindowDimensions,
 } from "react-native";
 import Markdown from "react-native-markdown-display";
@@ -26,6 +29,10 @@ import { useFocusEffect } from "@react-navigation/native";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import Badge from "../components/Badge";
 import WebStatusBanner from "../components/WebStatusBanner";
+import SmartEditInput from "../components/SmartEditInput";
+import SmartEditDiffSheet from "../components/SmartEditDiffSheet";
+import { useAmendLifecycle } from "../hooks/useAmendLifecycle";
+import { useAmendVoiceRecorder } from "../hooks/useAmendVoiceRecorder";
 import {
   fetchSample,
   fetchNote,
@@ -214,6 +221,50 @@ export default function EncounterDetailScreen({ route }: any) {
   const [error, setError] = useState<string | null>(null);
   const [webStatus, setWebStatus] = useState<WebStatus | null>(null);
 
+  // ── Smart Edit state ────────────────────────────────────────────────────
+  // Toggled by the toolbar button; reveals the sticky input bar at the bottom
+  // of the screen. Lifecycle + recorder live at screen scope so the diff sheet
+  // and the input bar share one source of truth.
+  const [smartEditOpen, setSmartEditOpen] = useState(false);
+  const amendLifecycle = useAmendLifecycle();
+  const amendRecorder = useAmendVoiceRecorder();
+  // After an Accept the server returns the new middleware version (e.g. "v2");
+  // subsequent edits in the same session must target it so versions chain.
+  // null means "amend the latest version on the server".
+  const currentNoteVersion = useRef<string | null>(null);
+  // Track the soft keyboard so the absolutely-positioned Smart Edit dock can
+  // float above it instead of being hidden behind the keyboard on iOS.
+  const [keyboardOffset, setKeyboardOffset] = useState(0);
+
+  // Reset the in-session amend state whenever the user switches notes.
+  useEffect(() => {
+    currentNoteVersion.current = null;
+    amendLifecycle.resetAll();
+    void amendRecorder.reset();
+    setSmartEditOpen(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sampleId]);
+
+  // Lift the docked input above the soft keyboard. Prefer `keyboardWillShow`
+  // on iOS so the lift animates in sync with the keyboard slide; Android
+  // doesn't fire the `Will` variants, so we fall back to `keyboardDidShow`.
+  useEffect(() => {
+    const showEvent =
+      Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent =
+      Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const showSub = Keyboard.addListener(showEvent, (e) => {
+      setKeyboardOffset(e.endCoordinates?.height ?? 0);
+    });
+    const hideSub = Keyboard.addListener(hideEvent, () => {
+      setKeyboardOffset(0);
+    });
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
   useEffect(() => {
     loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -289,10 +340,22 @@ export default function EncounterDetailScreen({ route }: any) {
   }
 
   if (error || !sample) {
+    const message = error ?? "Note not found.";
+    // Treat gateway / timeout signals as retryable so the user always has the
+    // option to try again instead of being stuck on a dead-end screen.
     return (
       <View style={styles.centered}>
-        <Ionicons name="alert-circle-outline" size={40} color={colors.error} />
-        <Text style={styles.errorText}>{error ?? "Not found"}</Text>
+        <Ionicons name="cloud-offline-outline" size={48} color={colors.error} />
+        <Text style={styles.errorTitle}>Couldn’t load this note</Text>
+        <Text style={styles.errorText}>{message}</Text>
+        <Pressable
+          style={styles.retryButton}
+          onPress={() => loadData()}
+          hitSlop={6}
+        >
+          <Ionicons name="refresh" size={16} color={colors.textInverse} />
+          <Text style={styles.retryButtonText}>Try again</Text>
+        </Pressable>
       </View>
     );
   }
@@ -322,12 +385,46 @@ export default function EncounterDetailScreen({ route }: any) {
   const modeLabel = sample.mode === "ambient" ? "Conversation" : "Dictation";
   const displayNoteContent = sanitizeNoteContent(noteContent);
 
+  // Smart Edit handlers — the lifecycle hook does the heavy lifting; the
+  // screen only owns the rendered note content and the in-session version.
+  const handleAmendAccepted = ({
+    amendedNote,
+    newVersion,
+  }: {
+    amendedNote: string;
+    newVersion: string;
+  }) => {
+    setNoteContent(amendedNote);
+    currentNoteVersion.current = newVersion;
+    encounterCache.set(sampleId, {
+      sample,
+      noteContent: amendedNote,
+    });
+    setSmartEditOpen(false);
+  };
+
+  const handleAmendRejected = () => {
+    void amendRecorder.reset();
+  };
+
+  const handleAmendRevise = () => {
+    // No-op — the lifecycle revise() already returned us to the input bar.
+  };
+
+  const closeSmartEdit = () => {
+    amendLifecycle.resetAll();
+    void amendRecorder.reset();
+    setSmartEditOpen(false);
+  };
+
   return (
+    <View style={{ flex: 1, backgroundColor: colors.bg }}>
     <ScrollView
       style={styles.container}
       contentContainerStyle={[
         styles.contentContainer,
         isTablet && styles.tabletContent,
+        smartEditOpen && styles.contentContainerWithSmartEdit,
       ]}
     >
       {/* Patient Details */}
@@ -368,42 +465,77 @@ export default function EncounterDetailScreen({ route }: any) {
       </Section>
 
       {/* SOAP Note metadata */}
-      <Section title="SOAP Note">
-        <View style={styles.fieldRow}>
-          <View style={styles.fieldIconWrap}>
-            <Ionicons name="document-text-outline" size={16} color={colors.brand} />
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.fieldLabel}>Note ID</Text>
-            <Text style={styles.fieldValueMono} numberOfLines={3}>
-              {sample.sample_id}
+      <View style={styles.section}>
+        <View style={styles.sectionHeaderRow}>
+          <Text style={styles.sectionTitle}>SOAP Note</Text>
+          <Pressable
+            style={[
+              styles.smartEditButton,
+              smartEditOpen && styles.smartEditButtonActive,
+            ]}
+            onPress={() =>
+              setSmartEditOpen((open) => {
+                if (open) {
+                  amendLifecycle.resetAll();
+                  void amendRecorder.reset();
+                }
+                return !open;
+              })
+            }
+            hitSlop={6}
+          >
+            <Ionicons
+              name="sparkles-outline"
+              size={14}
+              color={smartEditOpen ? colors.textInverse : colors.brand}
+            />
+            <Text
+              style={[
+                styles.smartEditButtonText,
+                smartEditOpen && styles.smartEditButtonTextActive,
+              ]}
+            >
+              Smart Edit
             </Text>
-          </View>
+          </Pressable>
         </View>
-
-        {/* Web-status banner (non-dismissible) */}
-        <WebStatusBanner webStatus={webStatus} />
-
-        <View style={styles.metaInline}>
-          <Badge
-            label={modeLabel}
-            variant={sample.mode === "dictation" ? "info" : "success"}
-          />
-          {score != null ? (
-            <Text style={styles.qualityText}>
-              Quality:{" "}
-              <Text
-                style={{
-                  color: score >= 4.0 ? colors.brand : colors.warning,
-                  fontWeight: "700",
-                }}
-              >
-                {score.toFixed(2)}
+        <View style={styles.sectionCard}>
+          <View style={styles.fieldRow}>
+            <View style={styles.fieldIconWrap}>
+              <Ionicons name="document-text-outline" size={16} color={colors.brand} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.fieldLabel}>Note ID</Text>
+              <Text style={styles.fieldValueMono} numberOfLines={3}>
+                {sample.sample_id}
               </Text>
-            </Text>
-          ) : null}
+            </View>
+          </View>
+
+          {/* Web-status banner (non-dismissible) */}
+          <WebStatusBanner webStatus={webStatus} />
+
+          <View style={styles.metaInline}>
+            <Badge
+              label={modeLabel}
+              variant={sample.mode === "dictation" ? "info" : "success"}
+            />
+            {score != null ? (
+              <Text style={styles.qualityText}>
+                Quality:{" "}
+                <Text
+                  style={{
+                    color: score >= 4.0 ? colors.brand : colors.warning,
+                    fontWeight: "700",
+                  }}
+                >
+                  {score.toFixed(2)}
+                </Text>
+              </Text>
+            ) : null}
+          </View>
         </View>
-      </Section>
+      </View>
 
       {/* Note body */}
       <View style={styles.noteBody}>
@@ -414,6 +546,33 @@ export default function EncounterDetailScreen({ route }: any) {
         )}
       </View>
     </ScrollView>
+
+      {smartEditOpen ? (
+        <View
+          style={[
+            styles.smartEditDock,
+            keyboardOffset > 0 && { bottom: keyboardOffset + spacing.sm },
+          ]}
+        >
+          <SmartEditInput
+            lifecycle={amendLifecycle}
+            recorder={amendRecorder}
+            encounterId={sampleId}
+            currentVersion={currentNoteVersion.current}
+            providerId={null}
+            baseNote={noteContent}
+            onClose={closeSmartEdit}
+          />
+        </View>
+      ) : null}
+
+      <SmartEditDiffSheet
+        lifecycle={amendLifecycle}
+        onAccepted={handleAmendAccepted}
+        onRejected={handleAmendRejected}
+        onRevise={handleAmendRevise}
+      />
+    </View>
   );
 }
 
@@ -459,7 +618,35 @@ const markdownStyles = StyleSheet.create({
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
   centered: { flex: 1, justifyContent: "center", alignItems: "center", padding: spacing.lg },
-  errorText: { fontSize: fontSize.sm, color: colors.error, marginTop: spacing.md, textAlign: "center" },
+  errorTitle: {
+    fontSize: fontSize.md,
+    color: colors.text,
+    fontWeight: "700",
+    marginTop: spacing.md,
+    textAlign: "center",
+  },
+  errorText: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    marginTop: spacing.xs,
+    textAlign: "center",
+    paddingHorizontal: spacing.lg,
+  },
+  retryButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: spacing.lg,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    backgroundColor: colors.brand,
+    borderRadius: radius.full,
+  },
+  retryButtonText: {
+    color: colors.textInverse,
+    fontWeight: "600",
+    fontSize: fontSize.sm,
+  },
 
   contentContainer: {
     paddingHorizontal: spacing.lg,
@@ -467,15 +654,55 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.xxl,
     gap: spacing.lg,
   },
+  // When Smart Edit's sticky input is showing, leave enough room at the
+  // bottom of the scroll area so the docked panel doesn't obscure the last
+  // few lines of the note.
+  contentContainerWithSmartEdit: {
+    paddingBottom: 220,
+  },
   tabletContent: { maxWidth: 900, alignSelf: "center", width: "100%" },
 
   section: {
+    gap: spacing.sm,
+  },
+  sectionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
     gap: spacing.sm,
   },
   sectionTitle: {
     fontSize: fontSize.lg,
     fontWeight: "700",
     color: colors.text,
+  },
+  smartEditButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 4,
+    borderRadius: radius.full,
+    borderWidth: 1,
+    borderColor: colors.brand,
+    backgroundColor: colors.card,
+  },
+  smartEditButtonActive: {
+    backgroundColor: colors.brand,
+  },
+  smartEditButtonText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: colors.brand,
+  },
+  smartEditButtonTextActive: {
+    color: colors.textInverse,
+  },
+  smartEditDock: {
+    position: "absolute",
+    left: spacing.md,
+    right: spacing.md,
+    bottom: spacing.md,
   },
   sectionCard: {
     backgroundColor: colors.card,

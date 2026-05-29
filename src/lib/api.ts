@@ -227,6 +227,43 @@ function getAuthHeaders(): Record<string, string> {
   return key ? { Authorization: `Bearer ${key}` } : {};
 }
 
+/** Strip HTML tags + collapse whitespace so error pages from nginx/ALB
+ *  (e.g. "<html><body>504 Gateway Time-out</body></html>") become a short
+ *  readable string instead of being dumped raw to the UI. */
+function cleanErrorBody(body: string): string {
+  if (!body) return "";
+  const stripped = body
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return stripped.length > 200 ? `${stripped.slice(0, 200)}…` : stripped;
+}
+
+/** Format a server error into a short, user-friendly sentence. Recognises
+ *  the common gateway/proxy failure modes (502/503/504) and the auth /
+ *  not-found cases so the screen doesn't dump raw HTML at the provider. */
+function friendlyHttpError(status: number, cleanedBody: string): string {
+  switch (status) {
+    case 502:
+    case 503:
+    case 504:
+      return "The server is taking too long to respond. Please try again in a moment.";
+    case 401:
+      return "Your session needs to be refreshed. Sign out and back in.";
+    case 403:
+      return "You don't have access to this note.";
+    case 404:
+      return "This note couldn't be found on the server.";
+    default:
+      return cleanedBody || `Request failed (HTTP ${status}).`;
+  }
+}
+
+const RETRYABLE_STATUS = new Set([408, 429, 502, 503, 504]);
+const GET_RETRY_DELAYS_MS = [600, 1500];
+
 async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
   const base = getApiUrl();
   let fullUrl = `${base}${path}`;
@@ -236,12 +273,42 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
       .join("&");
     fullUrl += `?${qs}`;
   }
-  const res = await fetch(fullUrl, { headers: { ...COMMON_HEADERS, ...getAuthHeaders() } });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`API ${res.status}: ${path} — ${body}`);
+
+  let lastErr: Error | null = null;
+  // 1 immediate attempt + retries on transient errors only (5xx, network
+  // failures). 4xx and other client errors bail immediately.
+  for (let attempt = 0; attempt <= GET_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const res = await fetch(fullUrl, {
+        headers: { ...COMMON_HEADERS, ...getAuthHeaders() },
+      });
+      if (res.ok) return res.json();
+
+      const cleaned = cleanErrorBody(await res.text().catch(() => ""));
+      const message = friendlyHttpError(res.status, cleaned);
+      const err = new Error(message);
+      (err as { status?: number }).status = res.status;
+
+      if (!RETRYABLE_STATUS.has(res.status)) throw err;
+      lastErr = err;
+    } catch (networkErr) {
+      // Surface non-retryable application errors immediately.
+      const status = (networkErr as { status?: number } | null)?.status;
+      if (status && !RETRYABLE_STATUS.has(status)) {
+        throw networkErr;
+      }
+      lastErr =
+        networkErr instanceof Error
+          ? networkErr
+          : new Error(String(networkErr));
+    }
+
+    if (attempt < GET_RETRY_DELAYS_MS.length) {
+      await new Promise((r) => setTimeout(r, GET_RETRY_DELAYS_MS[attempt]));
+    }
   }
-  return res.json();
+
+  throw lastErr ?? new Error("Request failed");
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
