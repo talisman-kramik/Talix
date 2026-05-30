@@ -107,6 +107,24 @@ export function buildEncounterDetails(params: {
 
 The offline queue (`src/store/offline.ts`) stores demographics alongside queued encounters so they're included when the queue is processed on reconnection.
 
+### Known Data-Sourcing Gaps (open — 2026-05-30)
+
+Web-history testing surfaced demographic fields that are missing or incorrect in
+the mobile upload. These are mobile/EHR data-sourcing issues (the web/middleware
+side handles whatever the mobile app sends):
+
+| # | Field | Issue |
+|---|-------|-------|
+| 1 | `account_number` / `case_name` | Sent as the **same value** (e.g. `AMM_LIVE.1.228977.0.1`). They should be distinct — a separate account number vs. case number. In `RecordScreen.tsx` both resolve from `patient_case_id`. |
+| 2 | `account_number` (Baltimore/Micro only) | Includes the `AMM_LIVE.` database prefix. Should be just `1.228977.0.1` (strip the prefix). |
+| 3 | `patient_dob` | Empty — DOB not captured/sent. Shows blank as DATE OF BIRTH in the SOAP header. |
+| 4 | injury date + supervising physician | Not included in the payload at all (D/ACCIDENT and SUPERVISING PHYSICIAN show blank). |
+
+The SQL/web path returns `ACCTNo` and `CaseNo` as separate values
+(e.g. account `1.209965.0`, case `AA51226`); the Eclipse/Micro appointment row
+should expose a distinct case field that the patient-search mapping
+(`api.ts` `mapEclipsePatientRows`) isn't currently carrying through.
+
 ---
 
 ## Testing
