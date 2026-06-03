@@ -49,7 +49,7 @@ jest.mock('../../lib/api', () => ({
 
 // Mock the settings store
 jest.mock('../../store/settings', () => ({
-  getApiUrl: () => 'http://localhost:8000',
+  getApiUrl: () => 'http://localhost:8100',
   getApiKey: () => 'test-key',
 }));
 

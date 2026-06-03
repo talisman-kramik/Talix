@@ -11,7 +11,7 @@
     "preview": {
       "distribution": "internal",
       "env": {
-        "EXPO_PUBLIC_AI_SCRIBE_API_URL": "http://98.88.67.46:8100",
+        "EXPO_PUBLIC_AI_SCRIBE_API_URL": "https://dev.talismansolutions.com:8100",
         "EXPO_PUBLIC_AI_SCRIBE_API_KEY": "151d994832e2b3c043ee7ccdcf41237e5e4ba9a985049a951ba96f267735581a",
         "EXPO_PUBLIC_ECLIPSE_API_URL": "https://prod.api.insightout.ttgda.com",
         "EXPO_PUBLIC_ECLIPSE_APPOINTMENTS_QUERY_UUID": "ADC7B240-3F9C-4B69-AE3E-FC01DB29F44E",
@@ -27,7 +27,7 @@
     "production": {
       "autoIncrement": true,
       "env": {
-        "EXPO_PUBLIC_AI_SCRIBE_API_URL": "http://98.88.67.46:8100",
+        "EXPO_PUBLIC_AI_SCRIBE_API_URL": "https://dev.talismansolutions.com:8100",
         "EXPO_PUBLIC_AI_SCRIBE_API_KEY": "151d994832e2b3c043ee7ccdcf41237e5e4ba9a985049a951ba96f267735581a",
         "EXPO_PUBLIC_ECLIPSE_API_URL": "https://prod.api.insightout.ttgda.com",
         "EXPO_PUBLIC_ECLIPSE_APPOINTMENTS_QUERY_UUID": "ADC7B240-3F9C-4B69-AE3E-FC01DB29F44E",

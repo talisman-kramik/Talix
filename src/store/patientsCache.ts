@@ -32,7 +32,9 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import type { EclipseLocation, PatientSearchResult } from "../lib/api";
 
-const KEY_PREFIX = "patients.cache.v1:";
+// v2: bumped after Eclipse demographic mapping fix (DOB / case_name / provider id
+// for Baltimore-Micro). v1 entries were cached without those fields populated.
+const KEY_PREFIX = "patients.cache.v2:";
 
 export const FRESH_TTL_MS = 30 * 60 * 1000;
 export const STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000;

@@ -10,7 +10,7 @@
  *   3. SOAP Note (id, mode, quality)
  *   4. Markdown body
  */
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useState } from "react";
 import {
   View,
   Text,
@@ -214,71 +214,69 @@ export default function EncounterDetailScreen({ route }: any) {
   const [error, setError] = useState<string | null>(null);
   const [webStatus, setWebStatus] = useState<WebStatus | null>(null);
 
-  useEffect(() => {
-    loadData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sampleId]);
+  const loadData = useCallback(
+    async (isActive: () => boolean = () => true) => {
+      // Only block the UI with a spinner on a true cold load (nothing cached).
+      // With cached content we keep the existing view rendered and refresh
+      // silently in the background so a reopen always reflects the latest
+      // server-side note, even after a backend edit.
+      const hasCachedContent = encounterCache.has(sampleId);
+      if (!hasCachedContent) setLoading(true);
+      setError(null);
 
-  // Non-blocking web-status fetch: fires on screen focus (mount, foreground, nav back)
+      try {
+        // Fire both requests in parallel. fetchNote without a `version` arg
+        // resolves to the latest version server-side, so we don't need to
+        // wait for fetchSample to tell us which version to ask for.
+        const [sampleRes, noteRes] = await Promise.all([
+          fetchSample(sampleId),
+          fetchNote(sampleId).catch(() => ({ content: "" as string })),
+        ]);
+
+        if (!isActive()) return;
+        setSample(sampleRes);
+        const content = noteRes.content ?? null;
+        setNoteContent(content);
+        encounterCache.set(sampleId, { sample: sampleRes, noteContent: content });
+      } catch (err) {
+        // If we already had cached content rendered, don't replace it with an
+        // error screen — surface the failure but keep the last-good view.
+        if (isActive() && !hasCachedContent) {
+          setError(err instanceof Error ? err.message : "Failed to load SOAP note");
+        }
+      } finally {
+        if (isActive()) setLoading(false);
+      }
+    },
+    [sampleId],
+  );
+
+  // Refetch on every focus (mount, foreground, navigate-back, reopen) so the
+  // note always shows the latest server data — not the copy cached on first
+  // open. Cached content still paints instantly; the refresh runs in the
+  // background and swaps in newer data when it arrives.
   useFocusEffect(
     useCallback(() => {
       let isActive = true;
 
+      loadData(() => isActive);
+
       const loadWebStatus = async () => {
         try {
           const status = await fetchWebStatus(sampleId);
-          if (isActive) {
-            setWebStatus(status);
-          }
+          if (isActive) setWebStatus(status);
         } catch {
           // Silent suppression: network error, timeout, non-200/non-404 → no banner
-          if (isActive) {
-            setWebStatus(null);
-          }
+          if (isActive) setWebStatus(null);
         }
       };
-
       loadWebStatus();
 
       return () => {
         isActive = false;
       };
-    }, [sampleId])
+    }, [sampleId, loadData]),
   );
-
-  const loadData = async () => {
-    // Only block the UI with a spinner on a true cold load. With cached
-    // content we keep the existing view rendered and refresh silently in
-    // the background.
-    const hasCachedContent = sample !== null;
-    if (!hasCachedContent) setLoading(true);
-    setError(null);
-
-    try {
-      // Fire both requests in parallel. fetchNote without a `version` arg
-      // resolves to the latest version server-side, so we don't need to
-      // wait for fetchSample to tell us which version to ask for. On prod
-      // this drops first-paint latency from ~4.5 s (sequential) to ~3.7 s
-      // (max of the two), a measured ~20% improvement.
-      const [sampleRes, noteRes] = await Promise.all([
-        fetchSample(sampleId),
-        fetchNote(sampleId).catch(() => ({ content: "" as string })),
-      ]);
-
-      setSample(sampleRes);
-      const content = noteRes.content ?? null;
-      setNoteContent(content);
-      encounterCache.set(sampleId, { sample: sampleRes, noteContent: content });
-    } catch (err) {
-      // If we already had cached content rendered, don't replace it with an
-      // error screen — surface the failure but keep the last-good view.
-      if (!hasCachedContent) {
-        setError(err instanceof Error ? err.message : "Failed to load SOAP note");
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
 
   if (loading) {
     return (

@@ -74,11 +74,22 @@ export interface PatientSearchResult {
   mrn: string;
   practice_id: string;
   appointment_class?: string;
+  /** Human-readable case label from Eclipse (e.g. "MD (MVA030925)"). */
+  case_name?: string;
+  /** SOAP case number from backend (`case_number` / Eclipse `patient_case_id`). */
+  case_number?: string;
   patient_case_id?: string;
+  /** Eclipse patient account id without case suffix (e.g. `AMM_LIVE.1.218174.0`). */
+  patient_id_raw?: string;
   appointment_id?: string;
   provider_source_id?: string;
+  guarantor_id?: string;
+  /** ISO date of injury / accident from Eclipse (`date_of_injury`). */
+  date_of_injury?: string;
   /** Real office / location name from Eclipse (e.g. "West Philadelphia"). */
   location?: string;
+  /** SQL/backend provider label (usually "Last, First") when enriched at upload. */
+  provider_name?: string;
   /** Raw appointment date/time string from Eclipse (e.g. "2026-05-12T10:30:00Z"
    *  or "2026-05-12 10:30:00"). Used for time-based auto-selection on the
    *  Record screen. May be a date-only or a full ISO datetime. */
@@ -170,10 +181,28 @@ export interface EncounterDemographics {
   provider_name: string;
   patient_name: string;
   patient_dob: string; // ISO 8601 date: YYYY-MM-DD
+  /** Pipeline/rqlite alias (DATE OF BIRTH header reads d_o_b). */
+  d_o_b?: string;
   account_number: string;
   case_name: string;
+  /** Full case id (may include AMM_LIVE. prefix) — maps to SOAP "CASE NUMBER". */
+  case_number?: string;
+  /** Injury / accident date — maps to SOAP header D/ACCIDENT. */
+  injury_date?: string;
+  /** Supervising / rendering physician — maps to SOAP header SUPERVISING PHYSICIAN. */
+  supervising_physician?: string;
+  /** Web/SFTP alias for supervising_physician. */
+  rendering_provider?: string;
+  /** Raw Eclipse field names — backend reads these per manager spec. */
+  patient_dob_at?: string;
+  patient_case_id?: string;
+  date_of_injury?: string;
+  /** Pipeline/SOAP alias used in encounter_details.json on server. */
+  date_of_accident?: string;
   location_name: string;
   system_location: string;
+  /** AMM appointment class for backend visit_type routing (not a case code). */
+  appointment_class?: string;
 }
 
 /**
@@ -185,8 +214,207 @@ export function validateProviderName(providerName: string): boolean {
 }
 
 /**
+ * Strip the Micro/Baltimore database prefix from account numbers.
+ * Eclipse returns `AMM_LIVE.1.218174.0`; the SOAP PM account expects `1.218174.0`.
+ */
+export function normalizeAccountNumber(raw: string | undefined | null): string {
+  const value = String(raw ?? "").trim();
+  if (!value) return "";
+  return value.replace(/^AMM_LIVE\./i, "");
+}
+
+/**
+ * Resolve the PM account number (RECORD NUMBER) from Eclipse fields.
+ * Prefer `patient_id` (account without case suffix) over `patient_case_id`
+ * (which includes the `.1` case suffix on Baltimore/Micro rows).
+ */
+export function resolvePmAccountNumber(
+  patient: Pick<PatientSearchResult, "patient_id_raw" | "patient_case_id" | "mrn">,
+): string {
+  const fromPatientId = String(patient.patient_id_raw || "").trim();
+  if (fromPatientId) {
+    return normalizeAccountNumber(fromPatientId);
+  }
+
+  let acct = normalizeAccountNumber(patient.patient_case_id || patient.mrn);
+  const parts = acct.split(".");
+  // patient_case_id fallback: drop trailing case segment (1.218174.0.1 → 1.218174.0).
+  if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
+    return parts.slice(0, 3).join(".");
+  }
+  return acct;
+}
+
+/** Micro/Baltimore record ids (e.g. `1.218174.0.1`) — not SOAP case codes like `WC122325`. */
+export function isRecordStyleCaseId(value: string): boolean {
+  return /^\d+\.\d+\.\d+(?:\.\d+)?$/.test(String(value || "").trim());
+}
+
+/** Appt class labels — not SOAP case codes (Eclipse sends `follow_up`, etc.). */
+const GENERIC_APPOINTMENT_CLASS_LABELS =
+  /^(workers?\s*comp(?:ensation)?|auto\s*accident|office\s*visit|follow[\s_-]*up|fu|new\s*patient|physical\s*therapy|initial\s*visit|established\s*patient|consult(?:ation)?)$/i;
+
+/** Normalize Eclipse/AMM labels (`follow_up` → `follow up`). */
+export function normalizeAppointmentLabel(value: string): string {
+  return String(value || "")
+    .trim()
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+export function isGenericAppointmentLabel(value: string): boolean {
+  const v = normalizeAppointmentLabel(value);
+  return Boolean(v && GENERIC_APPOINTMENT_CLASS_LABELS.test(v));
+}
+
+/** SQL `poi.case_name` / PA case labels (e.g. AWC11326, WC122325, MD(MVA051625)). */
+export function isLikelyCaseCode(value: string): boolean {
+  const v = String(value || "").trim();
+  if (!v || isRecordStyleCaseId(v) || isGenericAppointmentLabel(v)) return false;
+  if (/^(AWC|WC|PI|MVA|MD)\b/i.test(v)) return true;
+  if (/(?:MVA|WC|PI)\s*\(?\d{6}\)?/i.test(v)) return true;
+  if (/^[A-Z]{2,5}\d{4,}$/i.test(v)) return true;
+  return false;
+}
+
+/**
+ * Web/SFTP provider format: "Last, First". Eclipse picker uses "First Last".
+ */
+export function formatProviderNameLastFirst(name: string): string {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return "";
+  if (trimmed.includes(",")) return trimmed;
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return trimmed;
+  const last = parts[parts.length - 1];
+  const first = parts.slice(0, -1).join(" ");
+  return `${last}, ${first}`;
+}
+
+/**
+ * Resolve SOAP CASE NUMBER from Eclipse.
+ * WC-style codes (e.g. "WC122325", "MD (WC010214)") live in `case_name` for
+ * Pennsylvania. Baltimore/Micro rows have `case_name: null` — WC codes are not
+ * in Eclipse for those patients (web gets them from SQL). Never use
+ * `patient_case_id` here — that is a record id like 1.218174.0.1, not a case code.
+ */
+export function resolveCaseNumber(
+  patient: Pick<PatientSearchResult, "case_name" | "appointment_class" | "case_number">,
+): string {
+  const caseNumberField = String(patient.case_number || "").trim();
+  if (caseNumberField && !isRecordStyleCaseId(caseNumberField)) return caseNumberField;
+  const caseNameField = String(patient.case_name || "").trim();
+  if (caseNameField && isLikelyCaseCode(caseNameField)) return caseNameField;
+  return "";
+}
+
+/** Extract numeric Eclipse `appointment_provider_id` from encoded provider picker id. */
+export function resolveBackendProviderId(providerId: string): number | null {
+  const trimmed = String(providerId || "").trim();
+  if (!trimmed) return null;
+
+  if (trimmed.startsWith("eclid:")) {
+    const raw = trimmed.slice("eclid:".length);
+    const [idEnc] = raw.split("|");
+    const id = Number.parseInt(decodeURIComponent(idEnc || ""), 10);
+    return Number.isFinite(id) ? id : null;
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    return Number.parseInt(trimmed, 10);
+  }
+
+  return null;
+}
+
+/**
+ * Normalise DOB / injury dates to `YYYY-MM-DD`. Returns empty string when
+ * the source is missing or unusable (never sends "Unknown").
+ */
+export function normalizePatientDob(value: string | undefined | null): string {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.toLowerCase() === "unknown" || raw.toLowerCase() === "n/a") return "";
+  const direct = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (direct) return direct[1];
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toISOString().slice(0, 10);
+}
+
+/** DOB from Eclipse/Micro row — tries all known field aliases (PA + Baltimore). */
+export function resolveEclipsePatientDob(row: Record<string, unknown>): string {
+  for (const key of [
+    "patient_dob_at",
+    "patient_dob",
+    "date_of_birth",
+    "dob",
+    "patient_date_of_birth",
+  ]) {
+    const normalized = normalizePatientDob(row[key] as string | undefined | null);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+/** Numeric provider id on the appointment row (`appointment_provider_id`). */
+export function resolveEclipseAppointmentProviderId(row: Record<string, unknown>): string {
+  for (const key of ["appointment_provider_id", "provider_id"]) {
+    const value = String(row[key] ?? "").trim();
+    if (value && value !== "0") return value;
+  }
+  return "";
+}
+
+/**
+ * Pennsylvania Eclipse rows may include `date_of_injury` directly. When it is
+ * null, the accident date is sometimes encoded in case_name (MVA/WC/PI + MMDDYY).
+ */
+export function parseInjuryDateFromCaseLabel(
+  caseLabel: string | undefined | null,
+): string {
+  const raw = String(caseLabel ?? "").trim();
+  if (!raw) return "";
+
+  const match = raw.match(/(?:MVA|WC|PI)\s*\(?(\d{2})(\d{2})(\d{2})\)?/i);
+  if (!match) return "";
+
+  const [, mm, dd, yy] = match;
+  const month = Number(mm);
+  const day = Number(dd);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return "";
+
+  const yearNum = Number(yy);
+  const year = yearNum >= 70 ? 1900 + yearNum : 2000 + yearNum;
+  return `${year}-${mm}-${dd}`;
+}
+
+/** Resolve D/ACCIDENT — prefer Eclipse `date_of_injury`, else parse PA case code. */
+export function resolveInjuryDate(
+  patient: Pick<PatientSearchResult, "date_of_injury" | "case_name" | "case_number">,
+): string {
+  const fromEclipse = normalizePatientDob(patient.date_of_injury);
+  if (fromEclipse) return fromEclipse;
+  return parseInjuryDateFromCaseLabel(patient.case_name || patient.case_number);
+}
+
+/**
+ * Human-readable case label for encounter_details.case_name.
+ * Do not fall back to appointment_class — SOAP CASE NUMBER uses case_name when
+ * case_number is empty, and "Workers Compensation" is not a case code.
+ */
+export function resolvePatientCaseName(
+  patient: Pick<PatientSearchResult, "case_name" | "appointment_class">,
+): string {
+  const caseName = String(patient.case_name || "").trim();
+  if (caseName) return caseName;
+  const apptClass = String(patient.appointment_class || "").trim();
+  if (apptClass && !isGenericAppointmentLabel(apptClass)) return apptClass;
+  return "";
+}
+
+/**
  * Build the encounter_details demographics payload from available data.
- * All fields are required in the payload; missing values default to empty string.
+ * Core fields default to empty string; optional SOAP header fields are omitted when blank.
  */
 export function buildEncounterDetails(params: {
   providerName: string;
@@ -194,10 +422,18 @@ export function buildEncounterDetails(params: {
   patientDob: string;
   accountNumber?: string;
   caseName?: string;
+  caseNumber?: string;
+  injuryDate?: string;
+  supervisingPhysician?: string;
   locationName?: string;
   systemLocation?: string;
+  appointmentClass?: string;
+  /** Raw Eclipse keys (manager spec). */
+  patientDobAt?: string;
+  patientCaseId?: string;
+  dateOfInjury?: string;
 }): EncounterDemographics {
-  return {
+  const payload: EncounterDemographics = {
     provider_name: params.providerName,
     patient_name: params.patientName,
     patient_dob: params.patientDob,
@@ -206,6 +442,121 @@ export function buildEncounterDetails(params: {
     location_name: params.locationName ?? "",
     system_location: params.systemLocation ?? "",
   };
+  const appointmentClass = String(params.appointmentClass ?? "").trim();
+  // Only send non-generic classes — backend/SOAP must not treat "follow_up" as CASE NUMBER.
+  if (appointmentClass && !isGenericAppointmentLabel(appointmentClass)) {
+    payload.appointment_class = appointmentClass;
+  }
+  const caseNumber = String(params.caseNumber ?? "").trim();
+  const injuryDate = String(params.injuryDate ?? "").trim();
+  const supervising = String(params.supervisingPhysician ?? "").trim();
+  const dob =
+    String(params.patientDob ?? "").trim() || String(params.patientDobAt ?? "").trim();
+  const patientDobAt = String(params.patientDobAt ?? "").trim() || dob;
+  const patientCaseId = String(params.patientCaseId ?? "").trim();
+  const dateOfInjury =
+    String(params.dateOfInjury ?? "").trim() || injuryDate;
+  if (caseNumber) payload.case_number = caseNumber;
+  if (injuryDate) {
+    payload.injury_date = injuryDate;
+    payload.date_of_injury = injuryDate;
+    payload.date_of_accident = injuryDate;
+  }
+  if (supervising) {
+    payload.supervising_physician = supervising;
+    payload.rendering_provider = supervising;
+  }
+  if (dob) {
+    payload.patient_dob = dob;
+    payload.d_o_b = dob;
+    payload.patient_dob_at = patientDobAt || dob;
+  }
+  if (patientCaseId) payload.patient_case_id = patientCaseId;
+  if (dateOfInjury && !injuryDate) {
+    payload.date_of_injury = dateOfInjury;
+    payload.date_of_accident = dateOfInjury;
+    payload.injury_date = dateOfInjury;
+  }
+  return payload;
+}
+
+/**
+ * Build encounter_details from a selected patient row + provider context.
+ * Mirrors the web AI Scribe demographic mapping.
+ */
+export function buildEncounterDetailsFromPatient(params: {
+  patient: PatientSearchResult;
+  providerName: string;
+  systemLocation: EclipseLocation;
+}): EncounterDemographics {
+  const { patient, providerName, systemLocation } = params;
+  const patientName =
+    `${patient.first_name || ""} ${patient.last_name || ""}`.trim() ||
+    patient.mrn ||
+    patient.id;
+  const supervisingRaw = String(patient.provider_name || providerName).trim() || providerName;
+  const supervising = formatProviderNameLastFirst(supervisingRaw);
+  const formattedProvider = formatProviderNameLastFirst(providerName);
+  const injuryDate = resolveInjuryDate(patient);
+  const normalizedDob = normalizePatientDob(patient.date_of_birth);
+  const caseCode = resolveCaseNumber(patient);
+  // Web history / rqlite persist `case_name` only (not case_number) — store the WC code there.
+  const caseNameForSoap =
+    caseCode ||
+    (isLikelyCaseCode(resolvePatientCaseName(patient))
+      ? resolvePatientCaseName(patient)
+      : "");
+
+  return buildEncounterDetails({
+    providerName: formattedProvider || supervising,
+    patientName,
+    patientDob: normalizedDob,
+    accountNumber: resolvePmAccountNumber(patient),
+    caseName: caseNameForSoap,
+    caseNumber: caseCode,
+    injuryDate,
+    supervisingPhysician: supervising,
+    locationName:
+      String(patient.location || "").trim() || ECLIPSE_LOCATION_LABEL[systemLocation],
+    systemLocation,
+    appointmentClass: String(patient.appointment_class || "").trim() || undefined,
+    patientDobAt: normalizedDob,
+    patientCaseId: normalizeAccountNumber(patient.patient_case_id || patient.mrn),
+    dateOfInjury: injuryDate,
+  });
+}
+
+/** Collapse whitespace in encounter id parts; preserve `.` and `-` from Eclipse ids. */
+export function normalizeEncounterIdPart(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .replace(/\s+/g, "");
+}
+
+/**
+ * Resolve the client encounter_id to match the web AI Scribe convention.
+ * Web uses the appointment-level id: `formData.encounter_id || formData.appointment_id`
+ * (e.g. `232672`), not a composite with patient_case_id.
+ */
+export function resolveClientEncounterId(params: {
+  appointmentId?: string | null;
+  encounterId?: string | null;
+  patientCaseId?: string | null;
+  providerId?: string | null;
+  dateOfService?: string | null;
+}): string {
+  const fromEncounter = normalizeEncounterIdPart(params.encounterId);
+  if (fromEncounter) return fromEncounter;
+
+  const fromAppointment = normalizeEncounterIdPart(params.appointmentId);
+  if (fromAppointment) return fromAppointment;
+
+  // Last-resort composite when appointment id is missing (prefix stripped).
+  const patientCasePart =
+    normalizeEncounterIdPart(normalizeAccountNumber(params.patientCaseId)) || "unknown";
+  const datePart = String(params.dateOfService || "").trim().replace(/-/g, "") || "unknown";
+  const providerPart = normalizeEncounterIdPart(params.providerId) || "unknown";
+  return `${patientCasePart}_unknown_${providerPart}_${datePart}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -618,104 +969,18 @@ export const fetchProviders = async (
   location: EclipseLocation = "pennsylvania",
   options?: { signal?: AbortSignal },
 ): Promise<ProviderSummary[]> => {
-  const eclipse = getEclipseConfig();
-  if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
-    throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");
-  }
-
-  const sourceSystem = ECLIPSE_LOCATION_TO_SOURCE_SYSTEM[location];
   const signal = options?.signal;
 
   const now = Date.now();
   const cached = eclipseProvidersCache.get(location);
   if (cached && now - cached.fetchedAt < ECLIPSE_ROWS_TTL_MS) return cached.providers;
-  // Skip the in-flight dedupe when an external signal is passed — different
-  // callers may want to cancel independently, so they each get their own
-  // request rather than sharing a promise that someone else can abort.
   if (!signal) {
     const inFlight = eclipseProvidersInFlight.get(location);
     if (inFlight) return inFlight;
   }
 
-  const endpointBase = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
-  const baseParams: Record<string, string> = {
-    "filters[0][name]": "source_system",
-    "filters[0][operator]": "==",
-    "filters[0][values][0]": sourceSystem,
-    "overrides[other][isDistinct]": "1",
-    "overrides[fields][0][name]": "appointment_provider_id",
-    "overrides[fields][1][name]": "provider_first_name",
-    "overrides[fields][2][name]": "provider_last_name",
-    "overrides[fields][3][name]": "source_system",
-  };
-
   const promise = (async () => {
-    try {
-      // Manager spec: no `page` for distinct providers call.
-      // Retry same query shape with smaller perPage to reduce 504 risk.
-      let rows: EclipseProviderRow[] = [];
-      let lastErr: unknown = null;
-      for (const perPage of ["5000", "2000", "1000", "500"]) {
-        try {
-          rows = (await fetchEclipseQueryExecOnce(
-            endpointBase,
-            eclipse.token,
-            { ...baseParams, perPage },
-            { timeoutMs: 120000, retries: 3, signal },
-          )) as EclipseProviderRow[];
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err;
-          // Don't keep trying smaller page sizes after a user-initiated abort —
-          // propagate the cancel immediately.
-          const isAbort =
-            (err as { name?: string } | null)?.name === "AbortError" ||
-            signal?.aborted === true;
-          if (isAbort) throw err;
-        }
-      }
-      if (lastErr) throw lastErr;
-
-      const providers: ProviderSummary[] = [];
-      for (const row of rows) {
-        const first = String(row?.provider_first_name ?? "").trim();
-        const last = String(row?.provider_last_name ?? "").trim();
-        if (!first && !last) continue;
-        providers.push({
-          id: makeEclipseProviderId(first, last, row?.appointment_provider_id),
-          name: `${first} ${last}`.trim(),
-          credentials: null,
-          specialty: null,
-          latest_score: null,
-          quality_scores: {},
-        });
-      }
-
-      const sorted = sortByName(dedupeById(providers));
-      eclipseProvidersCache.set(location, { providers: sorted, fetchedAt: Date.now() });
-      await persistEclipseProviders(location, sorted);
-      return sorted;
-    } catch (networkErr) {
-      // A user-initiated abort must propagate as-is — don't fall back to a
-      // cached list, since the caller is intentionally switching away from
-      // this location.
-      const isAbort =
-        (networkErr as { name?: string } | null)?.name === "AbortError" ||
-        signal?.aborted === true;
-      if (isAbort) throw networkErr;
-
-      // Otherwise fall back to in-memory stale cache or persisted cache
-      // during transient 5xx.
-      const stale = eclipseProvidersCache.get(location);
-      if (stale?.providers?.length) return stale.providers;
-      const persisted = await loadPersistedEclipseProviders(location);
-      if (persisted?.length) {
-        eclipseProvidersCache.set(location, { providers: persisted, fetchedAt: Date.now() });
-        return persisted;
-      }
-      throw networkErr;
-    }
+    return fetchEclipseProvidersDirect(location, signal);
   })().finally(() => {
     if (!signal) {
       eclipseProvidersInFlight.delete(location);
@@ -728,8 +993,174 @@ export const fetchProviders = async (
   return promise;
 };
 
+async function fetchEclipseProvidersDirect(
+  location: EclipseLocation,
+  signal?: AbortSignal,
+): Promise<ProviderSummary[]> {
+  const eclipse = getEclipseConfig();
+  if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
+    throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");
+  }
+
+  const sourceSystem = ECLIPSE_LOCATION_TO_SOURCE_SYSTEM[location];
+  const endpointBase = `${eclipse.url}/api/v1/queries/${eclipse.uuid}/exec`;
+  const baseParams: Record<string, string> = {
+    "filters[0][name]": "source_system",
+    "filters[0][operator]": "==",
+    "filters[0][values][0]": sourceSystem,
+    "overrides[other][isDistinct]": "1",
+    "overrides[fields][0][name]": "appointment_provider_id",
+    "overrides[fields][1][name]": "provider_first_name",
+    "overrides[fields][2][name]": "provider_last_name",
+    "overrides[fields][3][name]": "source_system",
+  };
+
+  try {
+    let rows: EclipseProviderRow[] = [];
+    let lastErr: unknown = null;
+    for (const perPage of ["5000", "2000", "1000", "500"]) {
+      try {
+        rows = (await fetchEclipseQueryExecOnce(
+          endpointBase,
+          eclipse.token,
+          { ...baseParams, perPage },
+          { timeoutMs: 120000, retries: 3, signal },
+        )) as EclipseProviderRow[];
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        const isAbort =
+          (err as { name?: string } | null)?.name === "AbortError" ||
+          signal?.aborted === true;
+        if (isAbort) throw err;
+      }
+    }
+    if (lastErr) throw lastErr;
+
+    const providers: ProviderSummary[] = [];
+    for (const row of rows) {
+      const first = String(row?.provider_first_name ?? "").trim();
+      const last = String(row?.provider_last_name ?? "").trim();
+      if (!first && !last) continue;
+      providers.push({
+        id: makeEclipseProviderId(first, last, row?.appointment_provider_id),
+        name: `${first} ${last}`.trim(),
+        credentials: null,
+        specialty: null,
+        latest_score: null,
+        quality_scores: {},
+      });
+    }
+
+    const sorted = sortByName(dedupeById(providers));
+    eclipseProvidersCache.set(location, { providers: sorted, fetchedAt: Date.now() });
+    await persistEclipseProviders(location, sorted);
+    return sorted;
+  } catch (networkErr) {
+    const isAbort =
+      (networkErr as { name?: string } | null)?.name === "AbortError" ||
+      signal?.aborted === true;
+    if (isAbort) throw networkErr;
+
+    const stale = eclipseProvidersCache.get(location);
+    if (stale?.providers?.length) return stale.providers;
+    const persisted = await loadPersistedEclipseProviders(location);
+    if (persisted?.length) {
+      eclipseProvidersCache.set(location, { providers: persisted, fetchedAt: Date.now() });
+      return persisted;
+    }
+    throw networkErr;
+  }
+}
+
 export const fetchProvider = (id: string) =>
   get<Record<string, unknown>>(`/providers/${id}`);
+
+export type CaseNumberUploadVerdict = "real" | "generic" | "empty";
+
+/** Classify what SOAP will treat as CASE NUMBER from the upload payload. */
+export function classifyCaseNumberForUpload(value: string): CaseNumberUploadVerdict {
+  const v = String(value || "").trim();
+  if (!v) return "empty";
+  if (isGenericAppointmentLabel(v) || /^follow[_\s-]*up$/i.test(v)) return "generic";
+  if (isRecordStyleCaseId(v)) return "empty";
+  if (isLikelyCaseCode(v)) return "real";
+  return "real";
+}
+
+/**
+ * Human-readable pre-upload debug text (EXPO_PUBLIC_DEBUG_DEMOGRAPHICS=1).
+ * Highlights Baltimore case_number vs follow_up.
+ */
+export function formatEncounterDetailsDebugMessage(params: {
+  demographics: EncounterDemographics;
+  patient: PatientSearchResult;
+  systemLocation: EclipseLocation;
+}): string {
+  const { demographics, patient, systemLocation } = params;
+  const uploadCase = String(
+    demographics.case_number || demographics.case_name || "",
+  ).trim();
+  const verdict = classifyCaseNumberForUpload(uploadCase);
+  const verdictLabel =
+    verdict === "real"
+      ? "REAL case code"
+      : verdict === "generic"
+        ? "follow_up / generic (wrong for SOAP)"
+        : "EMPTY (no case code in Eclipse row)";
+
+  const lines = [
+    `Location: ${systemLocation}`,
+    "",
+    "CASE NUMBER (what upload sends)",
+    `  case_number: ${demographics.case_number ?? "(empty)"}`,
+    `  case_name: ${demographics.case_name ?? "(empty)"}`,
+    `  >>> ${verdictLabel}`,
+  ];
+
+  lines.push(
+    "",
+    "Eclipse row",
+    `  appointment_provider_id: ${patient.provider_source_id ?? "(none)"}`,
+    `  date_of_birth: ${patient.date_of_birth ?? "(empty)"}`,
+    `  case_name: ${patient.case_name ?? "(none)"}`,
+    `  case_number: ${patient.case_number ?? "(none)"}`,
+    `  appt class: ${patient.appointment_class ?? "(none)"}`,
+    `  appointment_class in JSON: ${demographics.appointment_class ?? "(omitted — good)"}`,
+  );
+
+  lines.push(
+    "",
+    "D/ACCIDENT",
+    `  injury_date: ${demographics.injury_date ?? "(empty)"}`,
+    `  date_of_injury: ${demographics.date_of_injury ?? "(empty)"}`,
+    "",
+    "DOB (upload)",
+    `  d_o_b: ${demographics.d_o_b ?? demographics.patient_dob ?? "(empty)"}`,
+  );
+
+  return lines.join("\n");
+}
+
+function filterPatientsByQuery(
+  patients: PatientSearchResult[],
+  q: string,
+): PatientSearchResult[] {
+  if (!q) return patients;
+  const query = normalizeText(q);
+  return patients.filter((r) => {
+    const fullName = normalizeText(`${r.first_name} ${r.last_name}`);
+    return (
+      normalizeText(r.first_name).includes(query) ||
+      normalizeText(r.last_name).includes(query) ||
+      fullName.includes(query) ||
+      normalizeText(r.mrn).includes(query) ||
+      normalizeText(r.id).includes(query) ||
+      normalizeText(r.case_number || "").includes(query)
+    );
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Patients
@@ -790,14 +1221,20 @@ function mapEclipsePatientRows(rows: any[]): PatientSearchResult[] {
       id: String(row.patient_case_id || row.patient_id || Math.random()),
       first_name: (row.first_name || "").trim(),
       last_name: (row.last_name || "").trim(),
-      date_of_birth: row.patient_dob_at || "Unknown",
-      sex: row.sex || "Unknown",
-      mrn: String(row.patient_case_id || row.patient_id || "Unknown"),
+      date_of_birth: resolveEclipsePatientDob(row),
+      sex: row.sex ? String(row.sex).trim() : "",
+      mrn: String(row.patient_case_id || row.patient_id || ""),
       practice_id: "Eclipse",
       appointment_class: row.case_class || row.appointment_status || undefined,
+      case_name: (row.case_name || "").trim() || undefined,
+      // WC codes are not in Micro/Eclipse — only set when case_name is present (PA).
+      case_number: (row.case_name || "").trim() || undefined,
       patient_case_id: String(row.patient_case_id ?? row.patient_id ?? ""),
+      patient_id_raw: row.patient_id ? String(row.patient_id).trim() : undefined,
       appointment_id: String(row.appointment_id ?? row.appt_id ?? row.appointment_no ?? ""),
-      provider_source_id: String(row.appointment_provider_id ?? ""),
+      provider_source_id: resolveEclipseAppointmentProviderId(row),
+      guarantor_id: row.guarantor_id ? String(row.guarantor_id).trim() : undefined,
+      date_of_injury: row.date_of_injury ? String(row.date_of_injury).trim() : undefined,
       location,
       appointment_at,
     };
@@ -812,6 +1249,15 @@ export const fetchPatientsByProviderDate = async (
   q = "",
   location: EclipseLocation = "pennsylvania",
 ): Promise<PatientSearchResult[]> => {
+  return fetchEclipsePatientsByProviderDate(providerId, appointmentDate, q, location);
+};
+
+async function fetchEclipsePatientsByProviderDate(
+  providerId: string,
+  appointmentDate: string,
+  q = "",
+  location: EclipseLocation = "pennsylvania",
+): Promise<PatientSearchResult[]> {
   const eclipse = getEclipseConfig();
   if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
     throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");
