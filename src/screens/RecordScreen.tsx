@@ -39,6 +39,8 @@ import {
   resolveClientEncounterId,
   fetchEncounterStatus,
   getWsUrl,
+  resolveVisitType,
+  formatPatientNameLastFirst,
   ECLIPSE_LOCATION_LABEL,
   type EclipseLocation,
   type PatientSearchResult,
@@ -49,13 +51,10 @@ import { useAuthStore } from "../store/auth";
 import { useProviders } from "../store/providers";
 import {
   getCachedPatients,
-  peekCachedPatients,
   setCachedPatients,
 } from "../store/patientsCache";
 import { findProviderForUser } from "../lib/providerMatch";
 import { formatDateUS } from "../lib/date";
-
-const FRONTEND_PARITY_VISIT_TYPE = "follow_up";
 
 const MODES = [
   { value: "dictation", label: "Dictation" },
@@ -69,8 +68,12 @@ function normalize(value: unknown): string {
 }
 
 function getPatientDisplayName(patient: Pick<PatientSearchResult, "first_name" | "last_name" | "mrn" | "id">): string {
-  const fullName = `${patient.first_name || ""} ${patient.last_name || ""}`.trim();
-  if (fullName) return fullName;
+  // Display "Last, First" to match the web app's patient list.
+  const first = String(patient.first_name || "").trim();
+  const last = String(patient.last_name || "").trim();
+  if (first && last) return `${last}, ${first}`;
+  const single = last || first;
+  if (single) return single;
   if (patient.mrn) return `MRN: ${patient.mrn}`;
   return patient.id;
 }
@@ -725,12 +728,12 @@ export default function RecordScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providers, authUserName, authUserEmail]);
 
-  // Patient search — fetch once per provider/date, filter locally. Now
-  // backed by the patientsCache so the picker paints **instantly** from
-  // memory / AsyncStorage when we've seen this (provider, date, location)
-  // combo before, then quietly refreshes in the background. A local
-  // `cancelled` flag prevents a late-arriving response from the previous
-  // provider/date/location from overwriting state after the user switches.
+  // Patient search — always fetch fresh from the Eclipse API on every
+  // provider/date/location change. We deliberately do NOT paint from cache
+  // first: a stale cache occasionally surfaced the previous date's patients
+  // when switching dates. The cache is now used only as an offline fallback
+  // when the network request fails. A local `cancelled` flag prevents a
+  // late-arriving response from a previous selection from overwriting state.
   useEffect(() => {
     setSelectedPatient(null);
     setPatientQuery("");
@@ -745,28 +748,14 @@ export default function RecordScreen() {
 
     let cancelled = false;
 
-    // 1) Synchronous in-memory peek — if we already loaded this combo in
-    //    this app session, paint immediately with zero awaits.
-    const memHit = peekCachedPatients(providerId, appointmentDate, eclipseLocation);
-    if (memHit && memHit.length > 0) {
-      setAllPatients(memHit);
-      setPatients(memHit);
-      setPatientsLoading(false);
-      if (appointmentDate === getEtDateIso()) {
-        const best = findClosestAppointment(memHit, getEtMinutesNow());
-        if (best) setSelectedPatient(best);
-      }
-    } else {
-      // No memory hit — clear stale rows and show the loading state. We may
-      // still get an AsyncStorage hit a few ms later that fills the list.
-      setPatients([]);
-      setAllPatients([]);
-      setPatientsLoading(true);
-    }
+    // Clear any rows from the previous provider/date and show loading. This
+    // guarantees the user never sees the prior selection's patients.
+    setPatients([]);
+    setAllPatients([]);
+    setPatientsLoading(true);
 
-    // Helper: apply a freshly resolved patient list to state + cache, with
-    // optional auto-select for today's schedule. Keeps the two callsites
-    // (cache hit, network refresh) DRY and consistent.
+    // Apply a resolved patient list to state (+ optionally persist to cache),
+    // with auto-select for today's schedule.
     const applyList = (list: PatientSearchResult[], persist: boolean) => {
       const sortedList = [...list].sort((a, b) =>
         normalize(`${a.last_name} ${a.first_name}`).localeCompare(
@@ -778,14 +767,7 @@ export default function RecordScreen() {
       }
       if (cancelled) return;
       setAllPatients(sortedList);
-      // Preserve the user's free-text filter across a background refresh.
-      setPatients((current) => {
-        if (current.length === 0) return sortedList;
-        // If we already had something rendered (cache hit), only update the
-        // full list — the typing-filter effect downstream will reapply the
-        // user's query against the new `allPatients`.
-        return sortedList;
-      });
+      setPatients(sortedList);
       if (appointmentDate === getEtDateIso()) {
         // Don't clobber a manual selection the user already made.
         setSelectedPatient((existing) => {
@@ -796,27 +778,8 @@ export default function RecordScreen() {
     };
 
     (async () => {
-      // 2) AsyncStorage fallback — async but cheap (typically <30 ms).
-      //    Only paints when the mem peek above missed.
-      if (!memHit || memHit.length === 0) {
-        const disk = await getCachedPatients(
-          providerId,
-          appointmentDate,
-          eclipseLocation,
-        );
-        if (cancelled) return;
-        if (disk.status === "fresh" || disk.status === "stale") {
-          applyList(disk.patients, false);
-          setPatientsLoading(false);
-          // "fresh" cache hits skip the network refresh entirely.
-          if (disk.status === "fresh") return;
-        }
-      }
-
-      // 3) Background refresh from Eclipse. We always fire this when there
-      //    was no in-memory hit OR the disk cache was stale — guarantees
-      //    the list is eventually current even if it painted from cache.
       try {
+        // Always go to the API so the list matches the selected date exactly.
         const list = await fetchPatientsByProviderDate(
           providerId,
           appointmentDate,
@@ -827,13 +790,25 @@ export default function RecordScreen() {
         applyList(list, true);
       } catch (err) {
         if (cancelled) return;
-        // Only surface the error when we have nothing else to show. A
-        // background refresh failure that follows a cache paint should be
-        // silent — the cached data is still useful.
-        setPatientLoadError((prev) => {
-          if (allPatients.length > 0) return prev;
-          return err instanceof Error ? err.message : "Failed to load patients";
-        });
+        // Network failure (e.g. offline) — fall back to cached rows for this
+        // exact (provider, date, location) so the screen still works.
+        const disk = await getCachedPatients(
+          providerId,
+          appointmentDate,
+          eclipseLocation,
+        ).catch(() => null);
+        if (cancelled) return;
+        if (
+          disk &&
+          (disk.status === "fresh" || disk.status === "stale") &&
+          disk.patients.length > 0
+        ) {
+          applyList(disk.patients, false);
+        } else {
+          setPatientLoadError(
+            err instanceof Error ? err.message : "Failed to load patients",
+          );
+        }
       } finally {
         if (!cancelled) setPatientsLoading(false);
       }
@@ -842,10 +817,6 @@ export default function RecordScreen() {
     return () => {
       cancelled = true;
     };
-    // allPatients is intentionally excluded from deps — including it would
-    // re-fire the network request every time the list updates (infinite
-    // loop). The effect should only re-run on the actual input keys.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providerId, appointmentDate, apiUrl, eclipseLocation]);
 
   // Local filtering when user types
@@ -1350,13 +1321,23 @@ export default function RecordScreen() {
     const effectiveNoteAudioUri = notesOverride?.uri ?? noteAudioUri;
     const effectiveNoteAudioFilename = notesOverride?.name ?? noteAudioFilename;
 
+    // Resolve visit_type from the Eclipse/Micro `new_repeat_patient` flag (the
+    // field web uses): "New" → "initial_evaluation", "Repeat" → "follow_up",
+    // for both locations. Falls back to the prior per-location logic only when
+    // the flag is missing (PA → "default", Baltimore → infer from appt class).
+    const visitType = resolveVisitType(
+      eclipseLocation,
+      selectedPatient.appointment_class,
+      selectedPatient.new_repeat_patient,
+    );
+
     // Check connectivity
     const online = await checkConnectivity();
     if (!online) {
       await enqueue({
         provider_id: providerId,
         patient_id: selectedPatient.id,
-          visit_type: FRONTEND_PARITY_VISIT_TYPE,
+          visit_type: visitType,
         mode,
         audioUri: recordingUri,
           filename: audioFilename,
@@ -1379,7 +1360,10 @@ export default function RecordScreen() {
         String(selectedPatient.patient_case_id || "").trim() ||
         String(selectedPatient.mrn || "").trim() ||
         String(selectedPatient.id || "").trim();
-      const patientNameForRequest = `${selectedPatient.first_name || ""} ${selectedPatient.last_name || ""}`.trim();
+      const patientNameForRequest = formatPatientNameLastFirst(
+        selectedPatient.first_name,
+        selectedPatient.last_name,
+      );
       const providerIdCandidate =
         String(selectedPatient.provider_source_id || "").trim() ||
         String(encounterProviderId || "").trim() ||
@@ -1392,6 +1376,7 @@ export default function RecordScreen() {
         patientCaseId,
         providerId: providerIdForEncounter,
         dateOfService: appointmentDate,
+        location: eclipseLocation,
       });
 
       let enc;
@@ -1401,7 +1386,7 @@ export default function RecordScreen() {
           provider_id: encounterProviderId,
           patient_id: selectedPatient.id,
           patient_name: patientNameForRequest || undefined,
-            visit_type: FRONTEND_PARITY_VISIT_TYPE,
+            visit_type: visitType,
           mode,
           date_of_service: appointmentDate,
           created_at: new Date().toISOString(),
@@ -1421,7 +1406,7 @@ export default function RecordScreen() {
             provider_id: "dr_caleb_ademiloye",
             patient_id: selectedPatient.id,
             patient_name: patientNameForRequest || undefined,
-              visit_type: FRONTEND_PARITY_VISIT_TYPE,
+              visit_type: visitType,
             mode,
             date_of_service: appointmentDate,
             created_at: new Date().toISOString(),
@@ -1479,6 +1464,7 @@ export default function RecordScreen() {
         patient: selectedPatient,
         providerName: selectedProviderName || patientNameForRequest || "Unknown",
         systemLocation: eclipseLocation,
+        date: appointmentDate,
       });
 
       // Set EXPO_PUBLIC_DEBUG_DEMOGRAPHICS=1 in .env — popup before upload (case # + D/ACCIDENT).
@@ -1564,6 +1550,7 @@ export default function RecordScreen() {
     recordingUri,
     mode,
     stage,
+    eclipseLocation,
     checkConnectivity,
     enqueue,
     audioFilename,

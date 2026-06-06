@@ -74,6 +74,12 @@ export interface PatientSearchResult {
   mrn: string;
   practice_id: string;
   appointment_class?: string;
+  /** Eclipse/Micro New vs Repeat flag (`new_repeat_patient`) — drives visit_type
+   *  for both Pennsylvania and Baltimore (values "New" / "Repeat"). */
+  new_repeat_patient?: string;
+  /** Eclipse appointment status (e.g. "Confirmed", "Missed", "Rescheduled").
+   *  Used to hide cancelled-type appointments so the list matches the web. */
+  appointment_status?: string;
   /** Human-readable case label from Eclipse (e.g. "MD (MVA030925)"). */
   case_name?: string;
   /** SOAP case number from backend (`case_number` / Eclipse `patient_case_id`). */
@@ -183,6 +189,12 @@ export interface EncounterDemographics {
   patient_dob: string; // ISO 8601 date: YYYY-MM-DD
   /** Pipeline/rqlite alias (DATE OF BIRTH header reads d_o_b). */
   d_o_b?: string;
+  /**
+   * Appointment / visit date (YYYY-MM-DD) → SOAP "DATE OF EXAM" and the
+   * rqlite encounter appointment_date. Backend reads `date` (or
+   * `appointment_date`); without it the note falls back to today.
+   */
+  date?: string;
   account_number: string;
   case_name: string;
   /** Full case id (may include AMM_LIVE. prefix) — maps to SOAP "CASE NUMBER". */
@@ -278,6 +290,85 @@ export function isLikelyCaseCode(value: string): boolean {
 }
 
 /**
+ * New-patient / consult appointment-class keywords. Kept in sync with the web
+ * backend `_infer_visit_type` (ai_scribe/shared.py) so mobile and web route
+ * the same appointment classes to the same template.
+ */
+const INITIAL_VISIT_APPOINTMENT_KEYWORDS = [
+  "CONSLT", "CONSULT", "CONS/", "CONSU",
+  "NEWPAT", "NEWPT", "NEW PT", "NEW PA",
+  "INT MVA", "INT WC", "INT PI", "CHIRO INT", "COMAN INIT",
+  "ASSUME", "NP ONLY", "NP-SW", "NP/", "-NP",
+  "PT INIT", "DIS-NEW", "DSBLTY-NEW", "-NEW", " NEW",
+  "COG NEW", "MEND NP", "NC PRIME",
+  "TBI EVAL", "REOPEN-NEW", "1ST",
+  "ONLYNP", "ONLYIN", "ORTHNEWEST", "CONNP",
+];
+
+/**
+ * Map an AMM/Eclipse appointment classification to the middleware visit_type.
+ * Mirror of the web backend `_infer_visit_type`: new-patient / consult classes
+ * → "initial_evaluation", everything else (incl. unknown/empty) → "follow_up".
+ */
+export function inferVisitTypeFromAppointmentClass(appointmentClass?: string | null): string {
+  const appt = String(appointmentClass || "").toUpperCase();
+  if (INITIAL_VISIT_APPOINTMENT_KEYWORDS.some((kw) => appt.includes(kw))) {
+    return "initial_evaluation";
+  }
+  return "follow_up";
+}
+
+/**
+ * Map the Eclipse/Micro `new_repeat_patient` flag (Denis' new Fact Appointment
+ * Detail field — populated for BOTH Pennsylvania and Baltimore) to the
+ * visit_type used across the app. This is the same source of truth the web app
+ * uses, so mobile and web stay in sync:
+ *   - "New"    → "initial_evaluation"
+ *   - "Repeat" → "follow_up"
+ * Returns null when the flag is empty/unknown so callers can fall back.
+ */
+export function mapNewRepeatPatientToVisitType(
+  newRepeatPatient?: string | null,
+): string | null {
+  const value = String(newRepeatPatient || "").trim().toLowerCase();
+  if (value === "new") return "initial_evaluation";
+  if (value === "repeat") return "follow_up";
+  return null;
+}
+
+/**
+ * Resolve the visit_type. Prefers the explicit `new_repeat_patient` flag from
+ * Eclipse/Micro (the field web uses), so both locations map New/Repeat →
+ * initial_evaluation/follow_up identically. Falls back to the prior behaviour
+ * only when the flag is missing:
+ *   - Pennsylvania (Eclipse) → "default"
+ *   - Baltimore (Micro)      → infer from the appointment class
+ */
+export function resolveVisitType(
+  location: EclipseLocation,
+  appointmentClass?: string | null,
+  newRepeatPatient?: string | null,
+): string {
+  const fromNewRepeat = mapNewRepeatPatientToVisitType(newRepeatPatient);
+  if (fromNewRepeat) return fromNewRepeat;
+
+  if (location === "pennsylvania") return "default";
+  return inferVisitTypeFromAppointmentClass(appointmentClass);
+}
+
+/**
+ * Patient name in web/EHR "LASTNAME, FIRSTNAME" convention, built from the
+ * separate Eclipse first/last fields. Used for encounter_details.patient_name
+ * so mobile and web show the same name in history.
+ */
+export function formatPatientNameLastFirst(first?: string | null, last?: string | null): string {
+  const f = String(first || "").trim();
+  const l = String(last || "").trim();
+  if (f && l) return `${l}, ${f}`;
+  return l || f;
+}
+
+/**
  * Web/SFTP provider format: "Last, First". Eclipse picker uses "First Last".
  */
 export function formatProviderNameLastFirst(name: string): string {
@@ -289,6 +380,24 @@ export function formatProviderNameLastFirst(name: string): string {
   const last = parts[parts.length - 1];
   const first = parts.slice(0, -1).join(" ");
   return `${last}, ${first}`;
+}
+
+/**
+ * Provider display format used by the web app: "First Last" (e.g. "Scott Pello").
+ * Converts a "Last, First" label back to "First Last"; leaves an already
+ * first-last name untouched.
+ */
+export function formatProviderNameFirstLast(name: string): string {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return "";
+  if (trimmed.includes(",")) {
+    const [last, ...rest] = trimmed.split(",");
+    const first = rest.join(",").trim();
+    const lastName = last.trim();
+    if (first && lastName) return `${first} ${lastName}`;
+    return first || lastName;
+  }
+  return trimmed;
 }
 
 /**
@@ -420,6 +529,8 @@ export function buildEncounterDetails(params: {
   providerName: string;
   patientName: string;
   patientDob: string;
+  /** Appointment / visit date (YYYY-MM-DD) → SOAP "DATE OF EXAM". */
+  date?: string;
   accountNumber?: string;
   caseName?: string;
   caseNumber?: string;
@@ -442,6 +553,8 @@ export function buildEncounterDetails(params: {
     location_name: params.locationName ?? "",
     system_location: params.systemLocation ?? "",
   };
+  const visitDate = String(params.date ?? "").trim();
+  if (visitDate) payload.date = visitDate;
   const appointmentClass = String(params.appointmentClass ?? "").trim();
   // Only send non-generic classes — backend/SOAP must not treat "follow_up" as CASE NUMBER.
   if (appointmentClass && !isGenericAppointmentLabel(appointmentClass)) {
@@ -488,15 +601,26 @@ export function buildEncounterDetailsFromPatient(params: {
   patient: PatientSearchResult;
   providerName: string;
   systemLocation: EclipseLocation;
+  /** Selected visit/appointment date (YYYY-MM-DD). Falls back to the patient's
+   *  Eclipse appointment date when omitted. */
+  date?: string;
 }): EncounterDemographics {
   const { patient, providerName, systemLocation } = params;
+  // Prefer the explicitly selected visit date; fall back to the patient's raw
+  // Eclipse appointment datetime (date portion only).
+  const visitDate =
+    String(params.date ?? "").trim() ||
+    String(patient.appointment_at ?? "").split(/[T ]/)[0].trim();
+  // "LASTNAME, FIRSTNAME" to match the web/EHR history convention.
   const patientName =
-    `${patient.first_name || ""} ${patient.last_name || ""}`.trim() ||
+    formatPatientNameLastFirst(patient.first_name, patient.last_name) ||
     patient.mrn ||
     patient.id;
+  // Provider names follow the web display convention: "First Last" (e.g.
+  // "Scott Pello"), NOT "Last, First". (Patient names stay "Last, First".)
   const supervisingRaw = String(patient.provider_name || providerName).trim() || providerName;
-  const supervising = formatProviderNameLastFirst(supervisingRaw);
-  const formattedProvider = formatProviderNameLastFirst(providerName);
+  const supervising = formatProviderNameFirstLast(supervisingRaw);
+  const formattedProvider = formatProviderNameFirstLast(providerName);
   const injuryDate = resolveInjuryDate(patient);
   const normalizedDob = normalizePatientDob(patient.date_of_birth);
   const caseCode = resolveCaseNumber(patient);
@@ -511,6 +635,7 @@ export function buildEncounterDetailsFromPatient(params: {
     providerName: formattedProvider || supervising,
     patientName,
     patientDob: normalizedDob,
+    date: visitDate,
     accountNumber: resolvePmAccountNumber(patient),
     caseName: caseNameForSoap,
     caseNumber: caseCode,
@@ -526,37 +651,57 @@ export function buildEncounterDetailsFromPatient(params: {
   });
 }
 
-/** Collapse whitespace in encounter id parts; preserve `.` and `-` from Eclipse ids. */
-export function normalizeEncounterIdPart(value: unknown): string {
-  return String(value ?? "")
-    .trim()
-    .replace(/\s+/g, "");
+/** Clean an encounter-id segment: trim + remove internal whitespace; keep `.`/`-`. */
+function cleanEncounterIdSegment(value: unknown): string {
+  return String(value ?? "").trim().replace(/\s+/g, "");
 }
 
 /**
- * Resolve the client encounter_id to match the web AI Scribe convention.
- * Web uses the appointment-level id: `formData.encounter_id || formData.appointment_id`
- * (e.g. `232672`), not a composite with patient_case_id.
+ * Resolve the client encounter_id using the canonical EHR composite:
+ *   {patient_case_id}_{appointment_id}_{provider_id}_{YYYYMMDD}
+ *
+ * Each segment is trimmed (internal spaces removed, `.`/`-` kept), the date is
+ * reduced to YYYYMMDD, and a trailing `_YYYYMMDD` already on the appointment id
+ * is stripped first. Every id segment is run through `normalizeAccountNumber` so
+ * Baltimore's `AMM_LIVE.` prefix — which appears on both the patient id
+ * (`AMM_LIVE.1.84915.0.2`) and the provider id (`AMM_LIVE.146`) and contains an
+ * underscore that would corrupt the `_`-delimited id — is removed; this is a
+ * no-op for Pennsylvania.
+ *
+ * Linking note:
+ * - Pennsylvania: mobile and web both read from Eclipse, so the composite
+ *   produces the *same* id on both sides and links correctly.
+ * - Baltimore: web reads from SQL with different id values (e.g. patient `84915`
+ *   vs Eclipse `AMM_LIVE.1.84915.0.2`, appointment `119902` vs `40709553`), so
+ *   this composite will NOT match web until the backend reconciles the two id
+ *   namespaces. The format is still emitted for consistency / future linking.
  */
 export function resolveClientEncounterId(params: {
   appointmentId?: string | null;
-  encounterId?: string | null;
   patientCaseId?: string | null;
   providerId?: string | null;
   dateOfService?: string | null;
+  location?: EclipseLocation;
 }): string {
-  const fromEncounter = normalizeEncounterIdPart(params.encounterId);
-  if (fromEncounter) return fromEncounter;
+  const datePart = cleanEncounterIdSegment(params.dateOfService).replace(/-/g, "");
 
-  const fromAppointment = normalizeEncounterIdPart(params.appointmentId);
-  if (fromAppointment) return fromAppointment;
+  let appointment = cleanEncounterIdSegment(normalizeAccountNumber(params.appointmentId));
+  if (datePart) {
+    const suffix = `_${datePart}`;
+    if (appointment.endsWith(suffix)) {
+      appointment = appointment.slice(0, -suffix.length);
+    }
+  }
 
-  // Last-resort composite when appointment id is missing (prefix stripped).
-  const patientCasePart =
-    normalizeEncounterIdPart(normalizeAccountNumber(params.patientCaseId)) || "unknown";
-  const datePart = String(params.dateOfService || "").trim().replace(/-/g, "") || "unknown";
-  const providerPart = normalizeEncounterIdPart(params.providerId) || "unknown";
-  return `${patientCasePart}_unknown_${providerPart}_${datePart}`;
+  const patientCase = cleanEncounterIdSegment(normalizeAccountNumber(params.patientCaseId));
+  const provider = cleanEncounterIdSegment(normalizeAccountNumber(params.providerId));
+
+  return [
+    patientCase || "unknown",
+    appointment || "unknown",
+    provider || "unknown",
+    datePart || "unknown",
+  ].join("_");
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +798,67 @@ function dedupeById<T extends { id: string }>(items: T[]): T[] {
     out.push(item);
   }
   return out;
+}
+
+/**
+ * Appointment statuses the web schedule excludes from the patient list. These
+ * represent appointments that won't happen (cancelled, missed, moved), so the
+ * web's "original list" never shows them. Keeping mobile in sync means hiding
+ * the same set; any other status (Confirmed, Arrived, Seen, …) is kept.
+ */
+const EXCLUDED_APPOINTMENT_STATUSES = new Set([
+  "cancelled",
+  "canceled",
+  "missed",
+  "rescheduled",
+  "no show",
+  "no-show",
+  "noshow",
+]);
+
+export function isExcludedAppointmentStatus(status?: string | null): boolean {
+  return EXCLUDED_APPOINTMENT_STATUSES.has(String(status || "").trim().toLowerCase());
+}
+
+/**
+ * De-duplicate Eclipse appointment rows down to one entry per patient (matching
+ * the web list). Eclipse/Micro can return several rows for the same patient on
+ * the same day — e.g. one row tied to a real case and a second with no case.
+ * We key by the patient account (without case suffix) and prefer the row that
+ * carries a case name, preserving the first-seen order otherwise.
+ */
+export function dedupePatientsPreferCase(
+  items: PatientSearchResult[],
+): PatientSearchResult[] {
+  const byKey = new Map<string, PatientSearchResult>();
+  const order: string[] = [];
+  let uniqueCounter = 0;
+
+  for (const item of items) {
+    const key = String(item.patient_id_raw || item.patient_case_id || item.id || "")
+      .trim()
+      .toLowerCase();
+    if (!key) {
+      const uniqKey = `__uniq_${uniqueCounter++}`;
+      byKey.set(uniqKey, item);
+      order.push(uniqKey);
+      continue;
+    }
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, item);
+      order.push(key);
+      continue;
+    }
+    // Keep the row that has a case name when the existing one lacks it.
+    const existingHasCase = String(existing.case_name || "").trim().length > 0;
+    const currentHasCase = String(item.case_name || "").trim().length > 0;
+    if (!existingHasCase && currentHasCase) {
+      byKey.set(key, item);
+    }
+  }
+
+  return order.map((k) => byKey.get(k)).filter((v): v is PatientSearchResult => !!v);
 }
 
 function getEclipseConfig() {
@@ -1113,6 +1319,9 @@ export function formatEncounterDetailsDebugMessage(params: {
   const lines = [
     `Location: ${systemLocation}`,
     "",
+    "DATE OF EXAM (visit date)",
+    `  date: ${demographics.date ?? "(empty — falls back to today)"}`,
+    "",
     "CASE NUMBER (what upload sends)",
     `  case_number: ${demographics.case_number ?? "(empty)"}`,
     `  case_name: ${demographics.case_name ?? "(empty)"}`,
@@ -1226,6 +1435,9 @@ function mapEclipsePatientRows(rows: any[]): PatientSearchResult[] {
       mrn: String(row.patient_case_id || row.patient_id || ""),
       practice_id: "Eclipse",
       appointment_class: row.case_class || row.appointment_status || undefined,
+      new_repeat_patient:
+        String(row.new_repeat_patient ?? row.new_repeat ?? "").trim() || undefined,
+      appointment_status: String(row.appointment_status ?? "").trim() || undefined,
       case_name: (row.case_name || "").trim() || undefined,
       // WC codes are not in Micro/Eclipse — only set when case_name is present (PA).
       case_number: (row.case_name || "").trim() || undefined,
@@ -1240,7 +1452,11 @@ function mapEclipsePatientRows(rows: any[]): PatientSearchResult[] {
     };
   });
 
-  return mapped.filter((patient) => !isLikelyNoisyPatientRow(patient));
+  return mapped.filter(
+    (patient) =>
+      !isLikelyNoisyPatientRow(patient) &&
+      !isExcludedAppointmentStatus(patient.appointment_status),
+  );
 }
 
 export const fetchPatientsByProviderDate = async (
@@ -1370,7 +1586,7 @@ async function fetchEclipsePatientsByProviderDate(
   }
 
   const mapped = mapEclipsePatientRows(rows);
-  if (!q) return sortByName(dedupeById(mapped));
+  if (!q) return sortByName(dedupePatientsPreferCase(mapped));
 
   const query = normalizeText(q);
   const filtered = mapped.filter((r) => {
@@ -1383,7 +1599,7 @@ async function fetchEclipsePatientsByProviderDate(
       normalizeText(r.id).includes(query)
     );
   });
-  return sortByName(dedupeById(filtered));
+  return sortByName(dedupePatientsPreferCase(filtered));
 };
 
 // ---------------------------------------------------------------------------

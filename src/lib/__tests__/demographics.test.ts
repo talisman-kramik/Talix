@@ -8,10 +8,17 @@ import {
   classifyCaseNumberForUpload,
   formatEncounterDetailsDebugMessage,
   formatProviderNameLastFirst,
+  formatProviderNameFirstLast,
   resolveEclipseAppointmentProviderId,
   resolveEclipsePatientDob,
   isGenericAppointmentLabel,
   isLikelyCaseCode,
+  inferVisitTypeFromAppointmentClass,
+  resolveVisitType,
+  mapNewRepeatPatientToVisitType,
+  isExcludedAppointmentStatus,
+  dedupePatientsPreferCase,
+  formatPatientNameLastFirst,
   normalizeAccountNumber,
   normalizePatientDob,
   parseInjuryDateFromCaseLabel,
@@ -236,6 +243,18 @@ describe("formatEncounterDetailsDebugMessage", () => {
   });
 });
 
+describe("formatPatientNameLastFirst", () => {
+  it("formats first/last into LAST, FIRST", () => {
+    expect(formatPatientNameLastFirst("ADMIRAL", "ADDY")).toBe("ADDY, ADMIRAL");
+  });
+
+  it("returns the single available name when one part is missing", () => {
+    expect(formatPatientNameLastFirst("ADMIRAL", "")).toBe("ADMIRAL");
+    expect(formatPatientNameLastFirst("", "ADDY")).toBe("ADDY");
+    expect(formatPatientNameLastFirst("", "")).toBe("");
+  });
+});
+
 describe("formatProviderNameLastFirst", () => {
   it('converts "Faraz Rahman" to "Rahman, Faraz"', () => {
     expect(formatProviderNameLastFirst("Faraz Rahman")).toBe("Rahman, Faraz");
@@ -243,6 +262,24 @@ describe("formatProviderNameLastFirst", () => {
 
   it("leaves already-formatted names unchanged", () => {
     expect(formatProviderNameLastFirst("Rahman, Faraz")).toBe("Rahman, Faraz");
+  });
+});
+
+describe("formatProviderNameFirstLast", () => {
+  it('converts "Pello, Scott" to "Scott Pello"', () => {
+    expect(formatProviderNameFirstLast("Pello, Scott")).toBe("Scott Pello");
+  });
+
+  it("leaves an already first-last name unchanged", () => {
+    expect(formatProviderNameFirstLast("Scott Pello")).toBe("Scott Pello");
+  });
+
+  it("handles a single name", () => {
+    expect(formatProviderNameFirstLast("Pello")).toBe("Pello");
+  });
+
+  it("returns empty string for empty input", () => {
+    expect(formatProviderNameFirstLast("")).toBe("");
   });
 });
 
@@ -261,6 +298,147 @@ describe("isLikelyCaseCode", () => {
 
   it("accepts Baltimore SQL case codes", () => {
     expect(isLikelyCaseCode("AWC11326")).toBe(true);
+  });
+});
+
+describe("inferVisitTypeFromAppointmentClass", () => {
+  it("maps new-patient / consult classes to initial_evaluation", () => {
+    expect(inferVisitTypeFromAppointmentClass("CONSULT")).toBe("initial_evaluation");
+    expect(inferVisitTypeFromAppointmentClass("New Pt Eval")).toBe("initial_evaluation");
+    expect(inferVisitTypeFromAppointmentClass("INT MVA")).toBe("initial_evaluation");
+    expect(inferVisitTypeFromAppointmentClass("1ST VISIT")).toBe("initial_evaluation");
+  });
+
+  it("maps everything else (incl. unknown/empty) to follow_up", () => {
+    expect(inferVisitTypeFromAppointmentClass("Follow-Up")).toBe("follow_up");
+    expect(inferVisitTypeFromAppointmentClass("Office Visit")).toBe("follow_up");
+    expect(inferVisitTypeFromAppointmentClass("Auto Accident")).toBe("follow_up");
+    expect(inferVisitTypeFromAppointmentClass("")).toBe("follow_up");
+    expect(inferVisitTypeFromAppointmentClass(null)).toBe("follow_up");
+  });
+});
+
+describe("resolveVisitType", () => {
+  it("always returns default for Pennsylvania regardless of appointment class", () => {
+    expect(resolveVisitType("pennsylvania", "CONSULT")).toBe("default");
+    expect(resolveVisitType("pennsylvania", "Follow-Up")).toBe("default");
+    expect(resolveVisitType("pennsylvania", "")).toBe("default");
+  });
+
+  it("infers from appointment class for Baltimore", () => {
+    expect(resolveVisitType("baltimore", "NEWPT")).toBe("initial_evaluation");
+    expect(resolveVisitType("baltimore", "Follow-Up")).toBe("follow_up");
+    expect(resolveVisitType("baltimore", "")).toBe("follow_up");
+  });
+
+  it("prefers the new_repeat_patient flag for both locations (web parity)", () => {
+    // New → initial_evaluation, even for Pennsylvania (overrides "default").
+    expect(resolveVisitType("pennsylvania", "Follow-Up", "New")).toBe("initial_evaluation");
+    expect(resolveVisitType("baltimore", "", "New")).toBe("initial_evaluation");
+    // Repeat → follow_up, even when appointment class looks like a new visit.
+    expect(resolveVisitType("pennsylvania", "CONSULT", "Repeat")).toBe("follow_up");
+    expect(resolveVisitType("baltimore", "NEWPT", "Repeat")).toBe("follow_up");
+  });
+
+  it("falls back to per-location logic when new_repeat_patient is empty/unknown", () => {
+    expect(resolveVisitType("pennsylvania", "CONSULT", "")).toBe("default");
+    expect(resolveVisitType("pennsylvania", "CONSULT", "Unknown")).toBe("default");
+    expect(resolveVisitType("baltimore", "NEWPT", null)).toBe("initial_evaluation");
+    expect(resolveVisitType("baltimore", "Office Visit", undefined)).toBe("follow_up");
+  });
+});
+
+describe("mapNewRepeatPatientToVisitType", () => {
+  it('maps "New" → initial_evaluation (case-insensitive)', () => {
+    expect(mapNewRepeatPatientToVisitType("New")).toBe("initial_evaluation");
+    expect(mapNewRepeatPatientToVisitType(" new ")).toBe("initial_evaluation");
+    expect(mapNewRepeatPatientToVisitType("NEW")).toBe("initial_evaluation");
+  });
+
+  it('maps "Repeat" → follow_up (case-insensitive)', () => {
+    expect(mapNewRepeatPatientToVisitType("Repeat")).toBe("follow_up");
+    expect(mapNewRepeatPatientToVisitType(" repeat ")).toBe("follow_up");
+  });
+
+  it("returns null for empty / unknown values", () => {
+    expect(mapNewRepeatPatientToVisitType("")).toBeNull();
+    expect(mapNewRepeatPatientToVisitType(null)).toBeNull();
+    expect(mapNewRepeatPatientToVisitType(undefined)).toBeNull();
+    expect(mapNewRepeatPatientToVisitType("Maybe")).toBeNull();
+  });
+});
+
+describe("isExcludedAppointmentStatus", () => {
+  it("excludes cancelled-type statuses (case-insensitive)", () => {
+    expect(isExcludedAppointmentStatus("Missed")).toBe(true);
+    expect(isExcludedAppointmentStatus("rescheduled")).toBe(true);
+    expect(isExcludedAppointmentStatus("Cancelled")).toBe(true);
+    expect(isExcludedAppointmentStatus("Canceled")).toBe(true);
+    expect(isExcludedAppointmentStatus(" No Show ")).toBe(true);
+  });
+
+  it("keeps active statuses", () => {
+    expect(isExcludedAppointmentStatus("Confirmed")).toBe(false);
+    expect(isExcludedAppointmentStatus("Arrived")).toBe(false);
+    expect(isExcludedAppointmentStatus("Seen")).toBe(false);
+    expect(isExcludedAppointmentStatus("")).toBe(false);
+    expect(isExcludedAppointmentStatus(null)).toBe(false);
+  });
+});
+
+describe("dedupePatientsPreferCase", () => {
+  const base = {
+    first_name: "SAMUEL",
+    last_name: "GIRON SIGUENZA",
+    date_of_birth: "1993-10-10",
+    sex: "",
+    practice_id: "Eclipse",
+  };
+
+  it("keeps one row per patient, preferring the row that has a case name", () => {
+    const rows: PatientSearchResult[] = [
+      {
+        ...base,
+        id: "AMM_LIVE.1.225680.0.0",
+        mrn: "AMM_LIVE.1.225680.0.0",
+        patient_case_id: "AMM_LIVE.1.225680.0.0",
+        patient_id_raw: "AMM_LIVE.1.225680.0",
+        case_name: undefined,
+      },
+      {
+        ...base,
+        id: "AMM_LIVE.1.225680.0.1",
+        mrn: "AMM_LIVE.1.225680.0.1",
+        patient_case_id: "AMM_LIVE.1.225680.0.1",
+        patient_id_raw: "AMM_LIVE.1.225680.0",
+        case_name: "WC102824",
+      },
+    ];
+    const result = dedupePatientsPreferCase(rows);
+    expect(result).toHaveLength(1);
+    expect(result[0].case_name).toBe("WC102824");
+  });
+
+  it("keeps distinct patients separate", () => {
+    const rows: PatientSearchResult[] = [
+      {
+        ...base,
+        id: "AMM_LIVE.1.111.0.1",
+        mrn: "AMM_LIVE.1.111.0.1",
+        patient_case_id: "AMM_LIVE.1.111.0.1",
+        patient_id_raw: "AMM_LIVE.1.111.0",
+        case_name: "WC1",
+      },
+      {
+        ...base,
+        id: "AMM_LIVE.1.222.0.1",
+        mrn: "AMM_LIVE.1.222.0.1",
+        patient_case_id: "AMM_LIVE.1.222.0.1",
+        patient_id_raw: "AMM_LIVE.1.222.0",
+        case_name: "WC2",
+      },
+    ];
+    expect(dedupePatientsPreferCase(rows)).toHaveLength(2);
   });
 });
 
@@ -416,34 +594,66 @@ describe("buildEncounterDetailsFromPatient", () => {
     expect(result.patient_dob).toBe("1964-06-27");
     expect(result.d_o_b).toBe("1964-06-27");
     expect(result.injury_date).toBe("2025-05-21");
-    expect(result.supervising_physician).toBe("Kebaish, Adel");
-    expect(result.rendering_provider).toBe("Kebaish, Adel");
+    expect(result.provider_name).toBe("Adel Kebaish");
+    expect(result.supervising_physician).toBe("Adel Kebaish");
+    expect(result.rendering_provider).toBe("Adel Kebaish");
     expect(result.d_o_b).toBe("1964-06-27");
     expect(result.injury_date).toBe("2025-05-21");
     expect(result.date_of_injury).toBe("2025-05-21");
   });
+
+  it("uses the explicitly selected visit date for the DATE OF EXAM field", () => {
+    const result = buildEncounterDetailsFromPatient({
+      patient,
+      providerName: "Adel Kebaish",
+      systemLocation: "baltimore",
+      date: "2026-01-13",
+    });
+    expect(result.date).toBe("2026-01-13");
+  });
+
+  it("falls back to the patient's Eclipse appointment date when no date is selected", () => {
+    const result = buildEncounterDetailsFromPatient({
+      patient: { ...patient, appointment_at: "2026-02-09T10:30:00Z" },
+      providerName: "Adel Kebaish",
+      systemLocation: "baltimore",
+    });
+    expect(result.date).toBe("2026-02-09");
+  });
+
+  it("omits date when neither a selected date nor an appointment date is available", () => {
+    const result = buildEncounterDetailsFromPatient({
+      patient,
+      providerName: "Adel Kebaish",
+      systemLocation: "baltimore",
+    });
+    expect(result).not.toHaveProperty("date");
+  });
 });
 
 describe("resolveClientEncounterId", () => {
-  it("uses appointment_id for Baltimore (web parity)", () => {
+  it("builds the 4-part composite for Baltimore, stripping the AMM_LIVE. prefix", () => {
     expect(
       resolveClientEncounterId({
-        appointmentId: "42623120",
-        patientCaseId: "AMM_LIVE.1.227792.0.1",
-        providerId: "0",
-        dateOfService: "2026-05-28",
+        location: "baltimore",
+        appointmentId: "40709553",
+        patientCaseId: "AMM_LIVE.1.84915.0.2",
+        providerId: "Excelsia.30.2",
+        dateOfService: "2026-06-03",
       }),
-    ).toBe("42623120");
+    ).toBe("1.84915.0.2_40709553_Excelsia.30.2_20260603");
   });
 
-  it("prefers explicit encounter_id when provided", () => {
+  it("strips the AMM_LIVE. prefix from the Baltimore provider id too", () => {
     expect(
       resolveClientEncounterId({
-        encounterId: "232672",
-        appointmentId: "42623120",
-        patientCaseId: "AMM_LIVE.1.227792.0.1",
+        location: "baltimore",
+        appointmentId: "40687289",
+        patientCaseId: "AMM_LIVE.1.227900.0.1",
+        providerId: "AMM_LIVE.146",
+        dateOfService: "2026-06-04",
       }),
-    ).toBe("232672");
+    ).toBe("1.227900.0.1_40687289_146_20260604");
   });
 
   it("falls back to composite with stripped case id when appointment id missing", () => {
@@ -454,6 +664,66 @@ describe("resolveClientEncounterId", () => {
         dateOfService: "2026-05-28",
       }),
     ).toBe("1.227792.0.1_unknown_42_20260528");
+  });
+
+  it("builds the 4-part EHR composite for Pennsylvania", () => {
+    expect(
+      resolveClientEncounterId({
+        location: "pennsylvania",
+        patientCaseId: "10200.2.Excelsia",
+        appointmentId: "44290913",
+        providerId: "Excelsia.28.1",
+        dateOfService: "2026-06-03",
+      }),
+    ).toBe("10200.2.Excelsia_44290913_Excelsia.28.1_20260603");
+  });
+
+  it("matches the spec example for Pennsylvania", () => {
+    expect(
+      resolveClientEncounterId({
+        location: "pennsylvania",
+        patientCaseId: "998877",
+        appointmentId: "445566",
+        providerId: "Excelsia.7.2",
+        dateOfService: "2026-05-09",
+      }),
+    ).toBe("998877_445566_Excelsia.7.2_20260509");
+  });
+
+  it("strips a trailing _YYYYMMDD already present on the PA appointment id", () => {
+    expect(
+      resolveClientEncounterId({
+        location: "pennsylvania",
+        patientCaseId: "998877",
+        appointmentId: "445566_20260509",
+        providerId: "Excelsia.7.2",
+        dateOfService: "2026-05-09",
+      }),
+    ).toBe("998877_445566_Excelsia.7.2_20260509");
+  });
+
+  it("removes internal spaces from PA segments but keeps . and -", () => {
+    expect(
+      resolveClientEncounterId({
+        location: "pennsylvania",
+        patientCaseId: " 10200.2.Excelsia ",
+        appointmentId: "44 290 913",
+        providerId: "Excelsia.28-1",
+        dateOfService: "2026-06-03",
+      }),
+    ).toBe("10200.2.Excelsia_44290913_Excelsia.28-1_20260603");
+  });
+
+  it("emits unknown for missing PA fields", () => {
+    expect(
+      resolveClientEncounterId({
+        location: "pennsylvania",
+        patientCaseId: "10200.2.Excelsia",
+        appointmentId: "",
+        providerId: "Excelsia.28.1",
+        dateOfService: "2026-06-03",
+      }),
+    ).toBe("10200.2.Excelsia_unknown_Excelsia.28.1_20260603");
   });
 });
 
