@@ -1371,13 +1371,15 @@ export default function RecordScreen() {
       const providerIdForEncounter = providerIdCandidate.startsWith("name:")
         ? providerIdCandidate.replace(/^name:/, "")
         : providerIdCandidate;
-      const clientEncounterId = resolveClientEncounterId({
-        appointmentId: selectedPatient.appointment_id,
-        patientCaseId,
-        providerId: providerIdForEncounter,
-        dateOfService: appointmentDate,
-        location: eclipseLocation,
-      });
+      const clientEncounterId =
+        (selectedPatient.encounter_id && selectedPatient.encounter_id.trim()) ||
+        resolveClientEncounterId({
+          appointmentId: selectedPatient.appointment_id,
+          patientCaseId,
+          providerId: providerIdForEncounter,
+          dateOfService: appointmentDate,
+          location: eclipseLocation,
+        });
 
       let enc;
       try {

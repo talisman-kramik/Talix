@@ -12,6 +12,7 @@ import {
   useWindowDimensions,
   ActivityIndicator,
   Linking,
+  Switch,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import * as WebBrowser from "expo-web-browser";
@@ -21,6 +22,7 @@ import Card from "../components/Card";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import { useOfflineStore } from "../store/offline";
 import { useAuthStore } from "../store/auth";
+import { useSettings } from "../store/settings";
 
 // Microsoft Entra ID logout URL
 const TENANT_ID = process.env.EXPO_PUBLIC_AZURE_TENANT_ID || "common";
@@ -36,6 +38,8 @@ export default function SettingsScreen() {
   const { isOnline, checkConnectivity } = useOfflineStore();
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
+  const unifiedSyncEnabled = useSettings((s) => s.unifiedSyncEnabled);
+  const setUnifiedSyncEnabled = useSettings((s) => s.setUnifiedSyncEnabled);
   const [loggingOut, setLoggingOut] = useState(false);
 
   const openExternal = async (url: string) => {
@@ -144,6 +148,23 @@ export default function SettingsScreen() {
           <TouchableOpacity onPress={checkConnectivity} style={{ marginLeft: "auto" }}>
             <Ionicons name="refresh" size={18} color={colors.textSecondary} />
           </TouchableOpacity>
+        </View>
+      </Card>
+
+      <Card>
+        <Text style={styles.label}>Data Source</Text>
+        <View style={styles.toggleRow}>
+          <View style={styles.toggleTextWrap}>
+            <Text style={styles.toggleTitle}>Unified data source (canonical feed)</Text>
+            <Text style={styles.hint}>
+              Read providers and appointments from the canonical server feed.
+            </Text>
+          </View>
+          <Switch
+            value={unifiedSyncEnabled}
+            onValueChange={setUnifiedSyncEnabled}
+            trackColor={{ false: colors.border, true: colors.brand }}
+          />
         </View>
       </Card>
 
@@ -272,6 +293,15 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   statusText: { fontSize: fontSize.sm, fontWeight: "600", marginLeft: spacing.sm },
+  toggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.md,
+    marginTop: spacing.sm,
+  },
+  toggleTextWrap: { flex: 1 },
+  toggleTitle: { fontSize: fontSize.sm, color: colors.text, fontWeight: "500" },
   linkRow: {
     marginTop: spacing.sm,
     borderWidth: 1,

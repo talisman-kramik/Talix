@@ -3,7 +3,7 @@
  * Typed SDK matching the web app's lib/api.ts interface.
  */
 
-import { getApiUrl, getApiKey } from "../store/settings";
+import { getApiUrl, getApiKey, isUnifiedSyncEnabled } from "../store/settings";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 // ---------------------------------------------------------------------------
@@ -67,6 +67,11 @@ export interface PatientContext {
 
 export interface PatientSearchResult {
   id: string;
+  /**
+   * Server-provided canonical encounter_id (unified-sync path); when present,
+   * upload reuses it instead of minting one locally.
+   */
+  encounter_id?: string;
   first_name: string;
   last_name: string;
   date_of_birth: string;
@@ -951,6 +956,113 @@ export const ECLIPSE_LOCATION_LABEL: Record<EclipseLocation, string> = {
   baltimore: "Baltimore",
 };
 
+// ---------------------------------------------------------------------------
+// Unified data source (canonical Pipeline_Server feed)
+//
+// When the `unifiedSyncEnabled` feature flag is on, providers and appointments
+// are read from the AWS Pipeline_Server canonical endpoints instead of Eclipse,
+// and the server-provided `encounter_id` is reused on upload. These endpoints
+// are served on the same host/port the app already targets (`getApiUrl()`) and
+// require the existing Bearer auth, so they reuse the `get<T>()` helper.
+// ---------------------------------------------------------------------------
+
+/** Canonical provider record from `GET /providers?location=`. */
+export interface CanonicalProviderSummary {
+  provider_id: string;
+  provider_name: string;
+}
+
+/** Canonical appointment record from `GET /appointments?location=&provider_id=&date=`. */
+export interface CanonicalAppointment {
+  encounter_id: string;
+  system_location: "baltimore" | "pennsylvania";
+  is_active: boolean;
+  source_system: "Micro" | "Eclipse";
+  source_appointment_id: string;
+  source_encounter_id: string;
+  provider_id: string;
+  provider_name: string;
+  patient_name: string;
+  first_name: string;
+  last_name: string;
+  account_number: string;
+  case_name: string;
+  case_number: string;
+  guarantor_id: string;
+  date_of_birth: string;
+  appointment_date: string;
+  appointment_class: string;
+  location_name: string;
+  injury_date: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Fetch canonical providers for a location from the Pipeline_Server feed. */
+export const fetchCanonicalProviders = (location: EclipseLocation) =>
+  get<CanonicalProviderSummary[]>("/providers", { location });
+
+/** Fetch canonical appointments for a provider + date from the Pipeline_Server feed. */
+export const fetchCanonicalAppointments = (
+  location: EclipseLocation,
+  providerId: string,
+  date: string,
+) =>
+  get<CanonicalAppointment[]>("/appointments", {
+    location,
+    provider_id: providerId,
+    date,
+  });
+
+/** Map a canonical provider record onto the app's `ProviderSummary` shape. */
+export function canonicalProviderToSummary(p: CanonicalProviderSummary): ProviderSummary {
+  return {
+    id: p.provider_id,
+    name: p.provider_name || null,
+    credentials: null,
+    specialty: null,
+    latest_score: null,
+    quality_scores: {},
+  };
+}
+
+/**
+ * Map a canonical appointment record onto `PatientSearchResult`, carrying the
+ * server-provided `encounter_id` so upload reuses it instead of minting one
+ * locally. Cancelled records (`is_active === false`) are given an excluded
+ * appointment status so they are filtered out by the same downstream
+ * `isExcludedAppointmentStatus` logic the Eclipse path uses.
+ */
+export function canonicalAppointmentToPatient(a: CanonicalAppointment): PatientSearchResult {
+  const appointmentId = String(a.source_appointment_id ?? "").trim();
+  const accountNumber = String(a.account_number ?? "").trim();
+  return {
+    id: appointmentId || accountNumber || String(a.encounter_id ?? ""),
+    encounter_id: a.encounter_id,
+    first_name: String(a.first_name ?? "").trim(),
+    last_name: String(a.last_name ?? "").trim(),
+    date_of_birth: normalizePatientDob(a.date_of_birth),
+    sex: "",
+    mrn: accountNumber,
+    practice_id: a.system_location,
+    appointment_class: String(a.appointment_class ?? "").trim() || undefined,
+    // Active rows stay active; cancelled rows get an excluded status so the
+    // shared filter drops them (web parity).
+    appointment_status: a.is_active === false ? "Cancelled" : undefined,
+    case_name: String(a.case_name ?? "").trim() || undefined,
+    case_number: String(a.case_number ?? "").trim() || undefined,
+    patient_case_id: accountNumber || undefined,
+    patient_id_raw: accountNumber || undefined,
+    appointment_id: appointmentId || undefined,
+    provider_source_id: String(a.provider_id ?? "").trim() || undefined,
+    guarantor_id: String(a.guarantor_id ?? "").trim() || undefined,
+    date_of_injury: String(a.injury_date ?? "").trim() || undefined,
+    location: String(a.location_name ?? "").trim() || undefined,
+    provider_name: String(a.provider_name ?? "").trim() || undefined,
+    appointment_at: String(a.appointment_date ?? "").trim() || undefined,
+  };
+}
+
 // Provider list changes infrequently (new providers added at human speed,
 // not minute-by-minute). 24 h matches the providers-store freshness window
 // so we don't pay a 6–16 s foreground Eclipse round-trip every time the
@@ -1175,6 +1287,14 @@ export const fetchProviders = async (
   location: EclipseLocation = "pennsylvania",
   options?: { signal?: AbortSignal },
 ): Promise<ProviderSummary[]> => {
+  // Unified data source: read providers from the canonical Pipeline_Server
+  // feed instead of Eclipse. Caching is intentionally simple here — a direct
+  // fetch + map — leaving the Eclipse cache path below untouched.
+  if (isUnifiedSyncEnabled()) {
+    const canonical = await fetchCanonicalProviders(location);
+    return sortByName(dedupeById(canonical.map(canonicalProviderToSummary)));
+  }
+
   const signal = options?.signal;
 
   const now = Date.now();
@@ -1474,6 +1594,35 @@ async function fetchEclipsePatientsByProviderDate(
   q = "",
   location: EclipseLocation = "pennsylvania",
 ): Promise<PatientSearchResult[]> {
+  // Unified data source: read appointments from the canonical Pipeline_Server
+  // feed instead of Eclipse. Map each record onto PatientSearchResult (carrying
+  // the server-provided encounter_id), then apply the SAME downstream filtering,
+  // dedupe and sort the Eclipse path uses below.
+  if (isUnifiedSyncEnabled()) {
+    const appointments = await fetchCanonicalAppointments(location, providerId, appointmentDate);
+    const mapped = appointments
+      .map(canonicalAppointmentToPatient)
+      .filter(
+        (patient) =>
+          !isLikelyNoisyPatientRow(patient) &&
+          !isExcludedAppointmentStatus(patient.appointment_status),
+      );
+    if (!q) return sortByName(dedupePatientsPreferCase(mapped));
+
+    const query = normalizeText(q);
+    const filtered = mapped.filter((r) => {
+      const fullName = normalizeText(`${r.first_name} ${r.last_name}`);
+      return (
+        normalizeText(r.first_name).includes(query) ||
+        normalizeText(r.last_name).includes(query) ||
+        fullName.includes(query) ||
+        normalizeText(r.mrn).includes(query) ||
+        normalizeText(r.id).includes(query)
+      );
+    });
+    return sortByName(dedupePatientsPreferCase(filtered));
+  }
+
   const eclipse = getEclipseConfig();
   if (!eclipse.url || !eclipse.uuid || !eclipse.token) {
     throw new Error("Eclipse provider config missing. Set EXPO_PUBLIC_ECLIPSE_* values.");

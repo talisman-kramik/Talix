@@ -54,12 +54,21 @@ interface SettingsState {
    * provider and patient lookups (pennsylvania → "Eclipse", baltimore → "Micro").
    */
   eclipseLocation: EclipseLocation;
+  /**
+   * Feature flag for the unified data source. When `true`, providers and
+   * appointments are read from the AWS Pipeline_Server canonical endpoints
+   * (`/providers`, `/appointments`) and encounter uploads reuse the
+   * server-provided `encounter_id`. When `false` (default), behavior is
+   * unchanged (existing Eclipse path).
+   */
+  unifiedSyncEnabled: boolean;
   loaded: boolean;
   /** Whether the user has explicitly saved a URL (vs. using auto-detected default) */
   configured: boolean;
   setApiUrl: (url: string) => void;
   setApiKey: (key: string) => void;
   setEclipseLocation: (location: EclipseLocation) => void;
+  setUnifiedSyncEnabled: (enabled: boolean) => void;
   load: () => Promise<void>;
 }
 
@@ -75,11 +84,12 @@ const DEFAULT_API_KEY = (process.env.EXPO_PUBLIC_AI_SCRIBE_API_KEY ?? "").trim()
  * app uses. Persisting the URL previously caused stale dev URLs to "stick"
  * across rebuilds (a saved dev URL would override a freshly-built prod env).
  */
-function persist(state: Pick<SettingsState, "eclipseLocation">) {
+function persist(state: Pick<SettingsState, "eclipseLocation" | "unifiedSyncEnabled">) {
   AsyncStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
       eclipseLocation: state.eclipseLocation,
+      unifiedSyncEnabled: state.unifiedSyncEnabled,
     }),
   );
 }
@@ -88,6 +98,7 @@ export const useSettings = create<SettingsState>((set, get) => ({
   apiUrl: DEFAULT_API_URL,
   apiKey: DEFAULT_API_KEY,
   eclipseLocation: DEFAULT_ECLIPSE_LOCATION,
+  unifiedSyncEnabled: false,
   loaded: false,
   configured: false,
   // In-memory only override for the current session (not persisted, so the
@@ -100,18 +111,25 @@ export const useSettings = create<SettingsState>((set, get) => ({
   },
   setEclipseLocation: (location: EclipseLocation) => {
     set({ eclipseLocation: location });
-    persist({ eclipseLocation: location });
+    persist({ eclipseLocation: location, unifiedSyncEnabled: get().unifiedSyncEnabled });
+  },
+  setUnifiedSyncEnabled: (enabled: boolean) => {
+    set({ unifiedSyncEnabled: enabled });
+    persist({ eclipseLocation: get().eclipseLocation, unifiedSyncEnabled: enabled });
   },
   load: async () => {
     try {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        // Only the Eclipse location is restored. apiUrl/apiKey are always
-        // taken from the build-time env defaults set above — any legacy
-        // persisted apiUrl/apiKey is ignored on purpose.
+        // Only the Eclipse location and unified-sync flag are restored.
+        // apiUrl/apiKey are always taken from the build-time env defaults set
+        // above — any legacy persisted apiUrl/apiKey is ignored on purpose.
         const location = parseEclipseLocation(parsed.eclipseLocation);
         if (location) set({ eclipseLocation: location });
+        if (typeof parsed.unifiedSyncEnabled === "boolean") {
+          set({ unifiedSyncEnabled: parsed.unifiedSyncEnabled });
+        }
       }
     } catch {
       // ignore
@@ -133,5 +151,14 @@ export function getApiKey(): string {
 /** Synchronous getter for the selected Eclipse location. */
 export function getEclipseLocation(): EclipseLocation {
   return useSettings.getState().eclipseLocation;
+}
+
+/**
+ * Synchronous getter for the unified data source feature flag (used by api.ts
+ * outside of React). When `true`, the canonical Pipeline_Server endpoints are
+ * used instead of the Eclipse path.
+ */
+export function isUnifiedSyncEnabled(): boolean {
+  return useSettings.getState().unifiedSyncEnabled;
 }
 
