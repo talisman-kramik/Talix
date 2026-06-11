@@ -215,6 +215,11 @@ export interface EncounterDemographics {
   system_location: string;
   /** AMM appointment class for backend visit_type routing (not a case code). */
   appointment_class?: string;
+  /** Structured Eclipse identifiers — carried so the web record stores the same
+   *  identity fields as web-created encounters (guarantor/appointment/case). */
+  guarantor_id?: string;
+  appointment_id?: string;
+  case_id?: string;
 }
 
 /**
@@ -543,6 +548,10 @@ export function buildEncounterDetails(params: {
   patientDobAt?: string;
   patientCaseId?: string;
   dateOfInjury?: string;
+  /** Structured Eclipse identifiers — forwarded to the web record. */
+  guarantorId?: string;
+  appointmentId?: string;
+  caseId?: string;
 }): EncounterDemographics {
   const payload: EncounterDemographics = {
     provider_name: params.providerName,
@@ -590,6 +599,12 @@ export function buildEncounterDetails(params: {
     payload.date_of_accident = dateOfInjury;
     payload.injury_date = dateOfInjury;
   }
+  const guarantorId = String(params.guarantorId ?? "").trim();
+  const appointmentId = String(params.appointmentId ?? "").trim();
+  const caseId = String(params.caseId ?? "").trim();
+  if (guarantorId) payload.guarantor_id = guarantorId;
+  if (appointmentId) payload.appointment_id = appointmentId;
+  if (caseId) payload.case_id = caseId;
   return payload;
 }
 
@@ -648,6 +663,11 @@ export function buildEncounterDetailsFromPatient(params: {
     patientDobAt: normalizedDob,
     patientCaseId: normalizeAccountNumber(patient.patient_case_id || patient.mrn),
     dateOfInjury: injuryDate,
+    // Structured identifiers (so the web record stores the same identity fields
+    // as web-created encounters). case_id mirrors the encounter_id case segment.
+    guarantorId: String(patient.guarantor_id || "").trim(),
+    appointmentId: String(patient.appointment_id || "").trim(),
+    caseId: normalizeAccountNumber(patient.patient_case_id || patient.mrn),
   });
 }
 
