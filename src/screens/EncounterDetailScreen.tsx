@@ -18,6 +18,7 @@ import {
   ScrollView,
   ActivityIndicator,
   useWindowDimensions,
+  Alert,
 } from "react-native";
 import Markdown from "react-native-markdown-display";
 import { Ionicons } from "@expo/vector-icons";
@@ -25,13 +26,12 @@ import { useFocusEffect } from "@react-navigation/native";
 
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import Badge from "../components/Badge";
-import WebStatusBanner from "../components/WebStatusBanner";
+import { shouldShowBanner, WEB_STATUS_MESSAGE } from "../components/WebStatusBanner";
 import {
   fetchSample,
   fetchNote,
   fetchWebStatus,
   type SampleDetail,
-  type WebStatus,
 } from "../lib/api";
 import { formatDateUS } from "../lib/date";
 
@@ -212,7 +212,6 @@ export default function EncounterDetailScreen({ route }: any) {
   // Only show the full-screen spinner when we have nothing to render at all.
   const [loading, setLoading] = useState(!cached);
   const [error, setError] = useState<string | null>(null);
-  const [webStatus, setWebStatus] = useState<WebStatus | null>(null);
 
   const loadData = useCallback(
     async (isActive: () => boolean = () => true) => {
@@ -261,13 +260,19 @@ export default function EncounterDetailScreen({ route }: any) {
 
       loadData(() => isActive);
 
+      // Web-status notice: instead of a permanent banner, surface a single
+      // dismissible popup when the note has been edited on the web. Shown at
+      // most once per focus so it doesn't reappear on the background refresh.
+      let webAlertShown = false;
       const loadWebStatus = async () => {
         try {
           const status = await fetchWebStatus(sampleId);
-          if (isActive) setWebStatus(status);
+          if (isActive && !webAlertShown && shouldShowBanner(status)) {
+            webAlertShown = true;
+            Alert.alert("Updated on the web", WEB_STATUS_MESSAGE, [{ text: "OK" }]);
+          }
         } catch {
-          // Silent suppression: network error, timeout, non-200/non-404 → no banner
-          if (isActive) setWebStatus(null);
+          // Silent suppression: network error, timeout, non-200/non-404 → no popup
         }
       };
       loadWebStatus();
@@ -378,9 +383,6 @@ export default function EncounterDetailScreen({ route }: any) {
             </Text>
           </View>
         </View>
-
-        {/* Web-status banner (non-dismissible) */}
-        <WebStatusBanner webStatus={webStatus} />
 
         <View style={styles.metaInline}>
           <Badge

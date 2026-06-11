@@ -9,8 +9,12 @@ import { Ionicons } from "@expo/vector-icons";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import type { WebStatus } from "../lib/api";
 
-/** Statuses that trigger the banner display */
+/** Statuses that trigger the "modified on the web" notice */
 const BANNER_STATUSES = ["Provider Edited", "Provider Reviewed", "MT Reviewed"] as const;
+
+/** Shared copy used by both the (legacy) banner and the dismissible popup. */
+export const WEB_STATUS_MESSAGE =
+  "This encounter has been modified on the web. Please refer to the web app for the latest version.";
 
 interface WebStatusBannerProps {
   webStatus: WebStatus | null;
@@ -32,9 +36,7 @@ export default function WebStatusBanner({ webStatus }: WebStatusBannerProps) {
   return (
     <View style={styles.banner}>
       <Ionicons name="information-circle" size={18} color={colors.warning} />
-      <Text style={styles.bannerText}>
-        This encounter has been modified on the web. Please refer to the web app for the latest version.
-      </Text>
+      <Text style={styles.bannerText}>{WEB_STATUS_MESSAGE}</Text>
     </View>
   );
 }

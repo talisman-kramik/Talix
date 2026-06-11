@@ -11,6 +11,7 @@
  * - Re-fetch on screen focus return
  */
 import React from 'react';
+import { Alert } from 'react-native';
 import { render, waitFor, act } from '@testing-library/react-native';
 import { shouldShowBanner } from '../../components/WebStatusBanner';
 import type { WebStatus } from '../../lib/api';
@@ -98,14 +99,21 @@ function renderScreen(routeOverride?: any) {
 
 // --- Tests ---
 
+let alertSpy: jest.SpyInstance;
+
 beforeEach(() => {
   jest.clearAllMocks();
   setupDefaultMocks();
+  alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
 });
 
-describe('EncounterDetailScreen — Web-Status Banner', () => {
-  describe('Banner display for valid status values', () => {
-    it('displays banner for "Provider Edited" status', async () => {
+afterEach(() => {
+  alertSpy.mockRestore();
+});
+
+describe('EncounterDetailScreen — Web-Status Popup', () => {
+  describe('Popup display for valid status values', () => {
+    it('shows popup for "Provider Edited" status', async () => {
       mockFetchWebStatus.mockResolvedValue({
         status: 'Provider Edited',
         edited_at: '2025-01-15T10:30:00Z',
@@ -114,14 +122,19 @@ describe('EncounterDetailScreen — Web-Status Banner', () => {
       });
 
       const { findByText } = renderScreen();
+      await findByText(/Clinical Note/);
 
-      // Wait for the banner text to appear
-      const bannerText = await findByText(/modified on the web/i);
-      expect(bannerText).toBeTruthy();
+      await waitFor(() => {
+        expect(alertSpy).toHaveBeenCalledWith(
+          'Updated on the web',
+          expect.stringMatching(/modified on the web/i),
+          expect.anything(),
+        );
+      });
       expect(mockFetchWebStatus).toHaveBeenCalledWith('test-encounter-123');
     });
 
-    it('displays banner for "Provider Reviewed" status', async () => {
+    it('shows popup for "Provider Reviewed" status', async () => {
       mockFetchWebStatus.mockResolvedValue({
         status: 'Provider Reviewed',
         edited_at: '2025-01-15T11:00:00Z',
@@ -130,13 +143,19 @@ describe('EncounterDetailScreen — Web-Status Banner', () => {
       });
 
       const { findByText } = renderScreen();
+      await findByText(/Clinical Note/);
 
-      const bannerText = await findByText(/modified on the web/i);
-      expect(bannerText).toBeTruthy();
+      await waitFor(() => {
+        expect(alertSpy).toHaveBeenCalledWith(
+          'Updated on the web',
+          expect.stringMatching(/modified on the web/i),
+          expect.anything(),
+        );
+      });
       expect(mockFetchWebStatus).toHaveBeenCalledWith('test-encounter-123');
     });
 
-    it('displays banner for "MT Reviewed" status', async () => {
+    it('shows popup for "MT Reviewed" status', async () => {
       mockFetchWebStatus.mockResolvedValue({
         status: 'MT Reviewed',
         edited_at: '2025-01-15T12:00:00Z',
@@ -145,47 +164,51 @@ describe('EncounterDetailScreen — Web-Status Banner', () => {
       });
 
       const { findByText } = renderScreen();
+      await findByText(/Clinical Note/);
 
-      const bannerText = await findByText(/modified on the web/i);
-      expect(bannerText).toBeTruthy();
+      await waitFor(() => {
+        expect(alertSpy).toHaveBeenCalledWith(
+          'Updated on the web',
+          expect.stringMatching(/modified on the web/i),
+          expect.anything(),
+        );
+      });
       expect(mockFetchWebStatus).toHaveBeenCalledWith('test-encounter-123');
     });
   });
 
-  describe('No banner on 404 or error', () => {
-    it('shows no banner when fetchWebStatus returns null (404)', async () => {
+  describe('No popup on 404 or error', () => {
+    it('shows no popup when fetchWebStatus returns null (404)', async () => {
       mockFetchWebStatus.mockResolvedValue(null);
 
-      const { queryByText, findByText } = renderScreen();
+      const { findByText } = renderScreen();
 
       // Wait for the component to finish loading (encounter data renders)
-      await findByText('Clinical Note');
+      await findByText(/Clinical Note/);
 
-      // No banner text should be present
-      expect(queryByText(/modified on the web/i)).toBeNull();
+      expect(alertSpy).not.toHaveBeenCalled();
     });
 
-    it('shows no banner when fetchWebStatus throws a network error', async () => {
+    it('shows no popup when fetchWebStatus throws a network error', async () => {
       mockFetchWebStatus.mockRejectedValue(new Error('Network request failed'));
 
-      const { queryByText, findByText } = renderScreen();
+      const { findByText } = renderScreen();
 
       // Wait for the component to finish loading
-      await findByText('Clinical Note');
+      await findByText(/Clinical Note/);
 
-      // No banner or error indication
-      expect(queryByText(/modified on the web/i)).toBeNull();
+      expect(alertSpy).not.toHaveBeenCalled();
     });
 
-    it('shows no banner when fetchWebStatus throws a timeout error', async () => {
+    it('shows no popup when fetchWebStatus throws a timeout error', async () => {
       mockFetchWebStatus.mockRejectedValue(new Error('AbortError: timeout'));
 
-      const { queryByText, findByText } = renderScreen();
+      const { findByText } = renderScreen();
 
       // Wait for the component to finish loading
-      await findByText('Clinical Note');
+      await findByText(/Clinical Note/);
 
-      expect(queryByText(/modified on the web/i)).toBeNull();
+      expect(alertSpy).not.toHaveBeenCalled();
     });
   });
 
@@ -197,15 +220,15 @@ describe('EncounterDetailScreen — Web-Status Banner', () => {
         () => new Promise((resolve) => { resolveWebStatus = resolve; })
       );
 
-      const { findByText, queryByText } = renderScreen();
+      const { findByText } = renderScreen();
 
       // Encounter content should render without waiting for web-status
-      await findByText('Clinical Note');
+      await findByText(/Clinical Note/);
 
       // Web-status was called but hasn't resolved yet — content is already visible
       expect(mockFetchWebStatus).toHaveBeenCalledWith('test-encounter-123');
-      // No banner yet since web-status hasn't resolved
-      expect(queryByText(/modified on the web/i)).toBeNull();
+      // No popup yet since web-status hasn't resolved
+      expect(alertSpy).not.toHaveBeenCalled();
 
       // Clean up: resolve the pending promise
       await act(async () => {
@@ -220,7 +243,7 @@ describe('EncounterDetailScreen — Web-Status Banner', () => {
       const { findByText } = renderScreen();
 
       // Encounter content should still load and render
-      await findByText('Clinical Note');
+      await findByText(/Clinical Note/);
     });
   });
 
@@ -231,7 +254,7 @@ describe('EncounterDetailScreen — Web-Status Banner', () => {
       const { findByText } = renderScreen();
 
       // Wait for initial render to complete
-      await findByText('Clinical Note');
+      await findByText(/Clinical Note/);
 
       // Initial fetch on mount/focus
       expect(mockFetchWebStatus).toHaveBeenCalledTimes(1);

@@ -86,8 +86,21 @@ describe("normalizeAccountNumber", () => {
     expect(normalizeAccountNumber("AMM_LIVE.1.218174.0")).toBe("1.218174.0");
   });
 
-  it("passes through Pennsylvania-style account numbers unchanged", () => {
-    expect(normalizeAccountNumber("12345.1.Excelsia")).toBe("12345.1.Excelsia");
+  it("strips the .Excelsia suffix (both locations)", () => {
+    expect(normalizeAccountNumber("9936.1.Excelsia")).toBe("9936.1");
+    expect(normalizeAccountNumber("54552.Excelsia")).toBe("54552");
+    expect(normalizeAccountNumber("AMM_LIVE.1.218174.0.Excelsia")).toBe("1.218174.0");
+  });
+
+  it("strips the Eclipse. prefix from Pennsylvania provider ids", () => {
+    expect(normalizeAccountNumber("Eclipse.132")).toBe("132");
+    expect(normalizeAccountNumber("Eclipse.33.4.Excelsia")).toBe("33.4");
+  });
+
+  it("leaves already-clean values unchanged", () => {
+    expect(normalizeAccountNumber("1.218174.0")).toBe("1.218174.0");
+    expect(normalizeAccountNumber("132")).toBe("132");
+    expect(normalizeAccountNumber("")).toBe("");
   });
 });
 
@@ -666,16 +679,16 @@ describe("resolveClientEncounterId", () => {
     ).toBe("1.227792.0.1_unknown_42_20260528");
   });
 
-  it("builds the 4-part EHR composite for Pennsylvania", () => {
+  it("builds the 4-part EHR composite for Pennsylvania, stripping Eclipse markers", () => {
     expect(
       resolveClientEncounterId({
         location: "pennsylvania",
         patientCaseId: "10200.2.Excelsia",
         appointmentId: "44290913",
-        providerId: "Excelsia.28.1",
+        providerId: "Eclipse.79",
         dateOfService: "2026-06-03",
       }),
-    ).toBe("10200.2.Excelsia_44290913_Excelsia.28.1_20260603");
+    ).toBe("10200.2_44290913_79_20260603");
   });
 
   it("matches the spec example for Pennsylvania", () => {
@@ -708,10 +721,10 @@ describe("resolveClientEncounterId", () => {
         location: "pennsylvania",
         patientCaseId: " 10200.2.Excelsia ",
         appointmentId: "44 290 913",
-        providerId: "Excelsia.28-1",
+        providerId: "Eclipse.28-1",
         dateOfService: "2026-06-03",
       }),
-    ).toBe("10200.2.Excelsia_44290913_Excelsia.28-1_20260603");
+    ).toBe("10200.2_44290913_28-1_20260603");
   });
 
   it("emits unknown for missing PA fields", () => {
@@ -720,10 +733,10 @@ describe("resolveClientEncounterId", () => {
         location: "pennsylvania",
         patientCaseId: "10200.2.Excelsia",
         appointmentId: "",
-        providerId: "Excelsia.28.1",
+        providerId: "Eclipse.28.1",
         dateOfService: "2026-06-03",
       }),
-    ).toBe("10200.2.Excelsia_unknown_Excelsia.28.1_20260603");
+    ).toBe("10200.2_unknown_28.1_20260603");
   });
 });
 

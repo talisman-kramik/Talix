@@ -1,7 +1,7 @@
 /**
  * Settings screen — profile, connectivity, privacy, and support.
  */
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import {
   View,
   Text,
@@ -21,6 +21,10 @@ import Card from "../components/Card";
 import { colors, fontSize, spacing, radius } from "../lib/theme";
 import { useOfflineStore } from "../store/offline";
 import { useAuthStore } from "../store/auth";
+import { getApiUrl } from "../store/settings";
+
+/** Number of taps on the Connectivity label required to reveal the API URL. */
+const ENV_REVEAL_TAPS = 7;
 
 // Microsoft Entra ID logout URL
 const TENANT_ID = process.env.EXPO_PUBLIC_AZURE_TENANT_ID || "common";
@@ -37,6 +41,18 @@ export default function SettingsScreen() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const [loggingOut, setLoggingOut] = useState(false);
+
+  // Hidden URL inspector: every ENV_REVEAL_TAPS taps on the Connectivity label
+  // shows the baked EXPO_PUBLIC_AI_SCRIBE_API_URL.
+  const tapCountRef = useRef(0);
+
+  const handleConnectivityTap = () => {
+    tapCountRef.current += 1;
+    if (tapCountRef.current >= ENV_REVEAL_TAPS) {
+      tapCountRef.current = 0;
+      Alert.alert("AI Scribe URL", getApiUrl() || "(none)", [{ text: "Close" }]);
+    }
+  };
 
   const openExternal = async (url: string) => {
     try {
@@ -131,7 +147,9 @@ export default function SettingsScreen() {
       </Card>
 
       <Card>
-        <Text style={styles.label}>Connectivity</Text>
+        <TouchableOpacity activeOpacity={1} onPress={handleConnectivityTap}>
+          <Text style={styles.label}>Connectivity</Text>
+        </TouchableOpacity>
         <View style={styles.row}>
           <Ionicons
             name={isOnline ? "cloud-done" : "cloud-offline"}

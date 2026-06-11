@@ -231,13 +231,28 @@ export function validateProviderName(providerName: string): boolean {
 }
 
 /**
- * Strip the Micro/Baltimore database prefix from account numbers.
- * Eclipse returns `AMM_LIVE.1.218174.0`; the SOAP PM account expects `1.218174.0`.
+ * Normalize Eclipse ID fields to match the web backend exactly.
+ *
+ * The web backend (now on the Eclipse API for BOTH locations) cleans every ID
+ * field — `patient_case_id`, `appointment_provider_id`, `guarantor_id` — by
+ * stripping the source-system markers before building `encounter_id`,
+ * `account_number`, and `case_number`:
+ *   - Baltimore (Micro):   `AMM_LIVE.1.218174.0.Excelsia` → `1.218174.0`
+ *   - Pennsylvania (Eclipse): `9936.1.Excelsia`            → `9936.1`
+ *                              `Eclipse.132`               → `132`
+ *
+ * Rules (mirror of the web):
+ *   - remove a leading `AMM_LIVE.` (Baltimore) or `Eclipse.` (Pennsylvania)
+ *   - remove a trailing `.Excelsia` (both locations)
+ * Keeping this identical to the web guarantees mobile/web produce matching ids.
  */
 export function normalizeAccountNumber(raw: string | undefined | null): string {
-  const value = String(raw ?? "").trim();
+  let value = String(raw ?? "").trim();
   if (!value) return "";
-  return value.replace(/^AMM_LIVE\./i, "");
+  value = value.replace(/^AMM_LIVE\./i, "");
+  value = value.replace(/^Eclipse\./i, "");
+  value = value.replace(/\.Excelsia$/i, "");
+  return value;
 }
 
 /**
