@@ -39,7 +39,8 @@ import {
   resolveClientEncounterId,
   fetchEncounterStatus,
   getWsUrl,
-  resolveVisitType,
+  deriveDefaultVisitType,
+  VISIT_TYPES,
   formatPatientNameLastFirst,
   ECLIPSE_LOCATION_LABEL,
   type EclipseLocation,
@@ -620,6 +621,14 @@ export default function RecordScreen() {
   const [providerPickerOpen, setProviderPickerOpen] = useState(false);
   const [selectedPatient, setSelectedPatient] = useState<PatientSearchResult | null>(null);
   const [mode, setMode] = useState("ambient");
+  // Provider-selectable Visit Type (Allowed_Visit_Type_Set). Seeded from the
+  // selected patient's `new_repeat_patient` flag via the same default-derivation
+  // helper the web recorder and backend fallback use; re-derived when the
+  // selected patient changes while the recorder is idle (see effect below), and
+  // overridable by explicit provider selection until recording locks it.
+  const [visitType, setVisitType] = useState<string>(() =>
+    deriveDefaultVisitType(selectedPatient?.new_repeat_patient),
+  );
 
   // Recording
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
@@ -666,6 +675,20 @@ export default function RecordScreen() {
   // complete / failed, or the safety cap is reached.
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const statusPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Re-derive the default Visit Type whenever the selected patient changes,
+  // but only while the recorder is idle (not in the Recording_Locked_State).
+  // Once recording has started / completed / is pending upload, the provider's
+  // chosen value is frozen and must not be silently reset by a patient swap.
+  // A provider's explicit selection while idle is preserved until the patient
+  // identity actually changes (the effect keys on the patient id).
+  const selectedPatientId = selectedPatient?.id ?? null;
+  const selectedPatientNewRepeat = selectedPatient?.new_repeat_patient;
+  useEffect(() => {
+    if (stage !== "idle") return;
+    setVisitType(deriveDefaultVisitType(selectedPatientNewRepeat));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPatientId]);
 
   // Offline
   const { isOnline, enqueue, checkConnectivity } = useOfflineStore();
@@ -1321,15 +1344,12 @@ export default function RecordScreen() {
     const effectiveNoteAudioUri = notesOverride?.uri ?? noteAudioUri;
     const effectiveNoteAudioFilename = notesOverride?.name ?? noteAudioFilename;
 
-    // Resolve visit_type from the Eclipse/Micro `new_repeat_patient` flag (the
-    // field web uses): "New" → "initial_evaluation", "Repeat" → "follow_up",
-    // for both locations. Falls back to the prior per-location logic only when
-    // the flag is missing (PA → "default", Baltimore → infer from appt class).
-    const visitType = resolveVisitType(
-      eclipseLocation,
-      selectedPatient.appointment_class,
-      selectedPatient.new_repeat_patient,
-    );
+    // Use the provider-selected Visit Type (component `visitType` state). It is
+    // seeded from the patient's `new_repeat_patient` flag via
+    // `deriveDefaultVisitType` and overridable by the provider until recording
+    // locks the selector, so the explicit selection takes precedence over the
+    // legacy `resolveVisitType` auto-derivation at submit time. Always a member
+    // of the Allowed_Visit_Type_Set; the backend re-validates regardless.
 
     // Check connectivity
     const online = await checkConnectivity();
@@ -1465,6 +1485,7 @@ export default function RecordScreen() {
         providerName: selectedProviderName || patientNameForRequest || "Unknown",
         systemLocation: eclipseLocation,
         date: appointmentDate,
+        visitType,
       });
 
       // Set EXPO_PUBLIC_DEBUG_DEMOGRAPHICS=1 in .env — popup before upload (case # + D/ACCIDENT).
@@ -1551,6 +1572,7 @@ export default function RecordScreen() {
     mode,
     stage,
     eclipseLocation,
+    visitType,
     checkConnectivity,
     enqueue,
     audioFilename,
@@ -1951,6 +1973,37 @@ export default function RecordScreen() {
                 >
                   <Text style={[styles.modeOptionTitle, active && styles.modeOptionTitleActive]}>
                     {m.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </View>
+
+        <View style={{ marginTop: spacing.md }}>
+          <Text style={styles.sublabel}>Visit Type</Text>
+          <View style={styles.modeOptionsRow}>
+            {VISIT_TYPES.map((vt) => {
+              const active = visitType === vt.value;
+              // Locked once recording starts / completes / is pending upload —
+              // mirrors the recording-locked condition used elsewhere on this
+              // screen (stage !== "idle").
+              const locked = stage !== "idle";
+              return (
+                <TouchableOpacity
+                  key={vt.value}
+                  onPress={() => setVisitType(vt.value)}
+                  disabled={locked}
+                  style={[
+                    styles.modeOptionCard,
+                    active && styles.modeOptionCardActive,
+                    locked && styles.modeOptionCardDisabled,
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active, disabled: locked }}
+                >
+                  <Text style={[styles.modeOptionTitle, active && styles.modeOptionTitleActive]}>
+                    {vt.label}
                   </Text>
                 </TouchableOpacity>
               );
@@ -2369,6 +2422,9 @@ const styles = StyleSheet.create({
   modeOptionCardActive: {
     borderColor: colors.brand,
     backgroundColor: "#ECFDF5",
+  },
+  modeOptionCardDisabled: {
+    opacity: 0.5,
   },
   modeOptionTitle: {
     fontSize: fontSize.sm,
