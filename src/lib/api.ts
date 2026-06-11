@@ -220,6 +220,12 @@ export interface EncounterDemographics {
   guarantor_id?: string;
   appointment_id?: string;
   case_id?: string;
+  /** Provider-selected clinical-note routing key — a member of the
+   *  Allowed_Visit_Type_Set ("initial_evaluation" | "follow_up" | "discharge").
+   *  Present when the provider's Visit Type selection is sent with the upload;
+   *  the backend re-validates and falls back to new_repeat_patient derivation
+   *  when omitted or invalid. */
+  visit_type?: string;
 }
 
 /**
@@ -374,6 +380,32 @@ export function resolveVisitType(
 
   if (location === "pennsylvania") return "default";
   return inferVisitTypeFromAppointmentClass(appointmentClass);
+}
+
+/**
+ * Provider-selectable Visit Type options for the recording screen. The `value`
+ * of each option is a member of the Allowed_Visit_Type_Set and maps one-to-one
+ * to a middleware `template_routing` key; the `label` is the provider-facing
+ * display text. Mirrors the web `visitTypeOptions` list.
+ */
+export const VISIT_TYPES: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "initial_evaluation", label: "Initial" },
+  { value: "follow_up", label: "Follow-Up" },
+  { value: "discharge", label: "Discharge" },
+];
+
+/**
+ * Derive the Default_Visit_Type pre-selected in the Visit Type selector from the
+ * Eclipse/Micro `new_repeat_patient` flag, using the same mapping the backend
+ * uses for fallback derivation so web and mobile stay in sync:
+ *   - "new" (trimmed, case-insensitive) → "initial_evaluation"
+ *   - any other value (incl. "Repeat", empty, null/undefined) → "follow_up"
+ * Never returns "discharge" — that option is reached only by explicit selection.
+ */
+export function deriveDefaultVisitType(newRepeatPatient?: string | null): string {
+  return String(newRepeatPatient ?? "").trim().toLowerCase() === "new"
+    ? "initial_evaluation"
+    : "follow_up";
 }
 
 /**
@@ -567,6 +599,9 @@ export function buildEncounterDetails(params: {
   guarantorId?: string;
   appointmentId?: string;
   caseId?: string;
+  /** Provider-selected Visit Type (member of the Allowed_Visit_Type_Set). Set on
+   *  the payload as `visit_type` only when provided and non-empty. */
+  visitType?: string;
 }): EncounterDemographics {
   const payload: EncounterDemographics = {
     provider_name: params.providerName,
@@ -620,6 +655,8 @@ export function buildEncounterDetails(params: {
   if (guarantorId) payload.guarantor_id = guarantorId;
   if (appointmentId) payload.appointment_id = appointmentId;
   if (caseId) payload.case_id = caseId;
+  const visitType = String(params.visitType ?? "").trim();
+  if (visitType) payload.visit_type = visitType;
   return payload;
 }
 
@@ -634,6 +671,9 @@ export function buildEncounterDetailsFromPatient(params: {
   /** Selected visit/appointment date (YYYY-MM-DD). Falls back to the patient's
    *  Eclipse appointment date when omitted. */
   date?: string;
+  /** Provider-selected Visit Type (member of the Allowed_Visit_Type_Set).
+   *  Forwarded onto the demographics payload when provided. */
+  visitType?: string;
 }): EncounterDemographics {
   const { patient, providerName, systemLocation } = params;
   // Prefer the explicitly selected visit date; fall back to the patient's raw
@@ -683,6 +723,7 @@ export function buildEncounterDetailsFromPatient(params: {
     guarantorId: String(patient.guarantor_id || "").trim(),
     appointmentId: String(patient.appointment_id || "").trim(),
     caseId: normalizeAccountNumber(patient.patient_case_id || patient.mrn),
+    visitType: params.visitType,
   });
 }
 
