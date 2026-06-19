@@ -62,12 +62,11 @@ const MODES = [
   { value: "ambient", label: "Conversation" },
 ];
 
-// Feature flag — live (streaming) transcription is temporarily DISABLED because
-// the WAV/PCM live-streaming path causes crashes on some devices. With this off,
-// recording uses the stable HIGH_QUALITY (m4a) path that the upload pipeline
-// already relies on; the SOAP note is still generated server-side after upload.
-// Flip back to `true` once the live-ASR streaming crash is fixed.
-const LIVE_TRANSCRIPTION_ENABLED = false;
+// Feature flag — live (streaming) transcription. When enabled, recording uses the
+// PCM/WAV streaming path so the live transcript can be shown while recording.
+// When disabled, recording uses the stable HIGH_QUALITY (m4a) path and the SOAP
+// note is generated server-side after upload.
+const LIVE_TRANSCRIPTION_ENABLED = true;
 
 type PipelineStage = "idle" | "recording" | "creating" | "uploading" | "processing" | "complete" | "error";
 
