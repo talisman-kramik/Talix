@@ -62,6 +62,13 @@ const MODES = [
   { value: "ambient", label: "Conversation" },
 ];
 
+// Feature flag — live (streaming) transcription is temporarily DISABLED because
+// the WAV/PCM live-streaming path causes crashes on some devices. With this off,
+// recording uses the stable HIGH_QUALITY (m4a) path that the upload pipeline
+// already relies on; the SOAP note is still generated server-side after upload.
+// Flip back to `true` once the live-ASR streaming crash is fixed.
+const LIVE_TRANSCRIPTION_ENABLED = false;
+
 type PipelineStage = "idle" | "recording" | "creating" | "uploading" | "processing" | "complete" | "error";
 
 function normalize(value: unknown): string {
@@ -967,27 +974,36 @@ export default function RecordScreen() {
         web: {},
       };
       let rec: Audio.Recording | null = null;
-      try {
-        const created = await Audio.Recording.createAsync(liveRecordingOptions);
-        rec = created.recording;
-        liveAsrFormatRef.current = "pcm";
-      } catch {
+      if (!LIVE_TRANSCRIPTION_ENABLED) {
+        // Live transcription disabled: record straight to the stable
+        // HIGH_QUALITY (m4a) preset — the same format used for the working
+        // audio-upload flow. No PCM/WAV streaming, so no live-ASR crash.
+        const stable = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+        rec = stable.recording;
+        liveAsrFormatRef.current = "none";
+      } else {
         try {
-          // Retry after resetting mode; first permission grant can race.
-          await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-          await new Promise((resolve) => setTimeout(resolve, 180));
-          await configureRecordingMode();
-          const createdRetry = await Audio.Recording.createAsync(liveRecordingOptions);
-          rec = createdRetry.recording;
+          const created = await Audio.Recording.createAsync(liveRecordingOptions);
+          rec = created.recording;
           liveAsrFormatRef.current = "pcm";
         } catch {
-          // Fallback to stable preset so recording still works.
-          await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-          await new Promise((resolve) => setTimeout(resolve, 120));
-          await configureRecordingMode();
-          const fallback = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-          rec = fallback.recording;
-          liveAsrFormatRef.current = "none";
+          try {
+            // Retry after resetting mode; first permission grant can race.
+            await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+            await new Promise((resolve) => setTimeout(resolve, 180));
+            await configureRecordingMode();
+            const createdRetry = await Audio.Recording.createAsync(liveRecordingOptions);
+            rec = createdRetry.recording;
+            liveAsrFormatRef.current = "pcm";
+          } catch {
+            // Fallback to stable preset so recording still works.
+            await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+            await new Promise((resolve) => setTimeout(resolve, 120));
+            await configureRecordingMode();
+            const fallback = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+            rec = fallback.recording;
+            liveAsrFormatRef.current = "none";
+          }
         }
       }
 
@@ -1005,10 +1021,12 @@ export default function RecordScreen() {
       setStage("recording");
       timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
       const recUri = rec.getURI();
-      if (recUri && liveAsrFormatRef.current === "pcm") {
-        startLiveTranscription(recUri, mode);
-      } else if (liveAsrFormatRef.current !== "pcm") {
-        setAsrError("Live transcription unavailable for this recording. Try recording again.");
+      if (LIVE_TRANSCRIPTION_ENABLED) {
+        if (recUri && liveAsrFormatRef.current === "pcm") {
+          startLiveTranscription(recUri, mode);
+        } else if (liveAsrFormatRef.current !== "pcm") {
+          setAsrError("Live transcription unavailable for this recording. Try recording again.");
+        }
       }
     } catch (err) {
       Alert.alert("Error", "Could not start recording.");
@@ -2176,7 +2194,8 @@ export default function RecordScreen() {
             )}
           </View>
         ) : null}
-        {stage === "recording" &&
+        {LIVE_TRANSCRIPTION_ENABLED &&
+          stage === "recording" &&
           (asrStreaming ||
             asrPartialText ||
             asrFinalSegments.length > 0 ||

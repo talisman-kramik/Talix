@@ -1760,6 +1760,22 @@ export async function resolveEncounterProviderId(
   return SAFE_PIPELINE_FALLBACK_PROVIDER_ID;
 }
 
+/**
+ * Make an uploaded filename safe for the multipart request. Spaces and other
+ * non [A-Za-z0-9._-] characters in the `filename="..."` part trigger 403s from
+ * the upload WAF / server validation, so we collapse them to underscores while
+ * keeping the extension. e.g. "martinexEric ChDischarge.mp3" → "martinexEric_ChDischarge.mp3".
+ */
+export function sanitizeUploadFilename(name?: string | null, fallback = "recording.m4a"): string {
+  const raw = String(name ?? "").trim();
+  if (!raw) return fallback;
+  const cleaned = raw
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[_.]+|_+$/g, "");
+  return cleaned || fallback;
+}
+
 export async function uploadEncounterAudio(
   encounterId: string,
   fileUri: string,
@@ -1772,13 +1788,13 @@ export async function uploadEncounterAudio(
   const form = new FormData();
   form.append("audio", {
     uri: fileUri,
-    name: filename,
+    name: sanitizeUploadFilename(filename),
     type: "audio/m4a",
   } as unknown as Blob);
   if (noteAudioUri) {
     const notePart = {
       uri: noteAudioUri,
-      name: noteFilename || "note_audio.m4a",
+      name: sanitizeUploadFilename(noteFilename, "note_audio.m4a"),
       type: "audio/m4a",
     } as unknown as Blob;
     // Keep both field names for backend compatibility.

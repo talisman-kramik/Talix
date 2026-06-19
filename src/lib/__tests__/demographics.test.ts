@@ -30,6 +30,7 @@ import {
   resolvePmAccountNumber,
   validateProviderName,
   uploadEncounterAudio,
+  sanitizeUploadFilename,
   type EncounterDemographics,
   type PatientSearchResult,
 } from "../api";
@@ -77,6 +78,28 @@ describe("buildEncounterDetails", () => {
     expect(result).not.toHaveProperty("supervising_physician");
     expect(result.account_number).toBe("");
     expect(result.case_name).toBe("");
+  });
+});
+
+describe("sanitizeUploadFilename", () => {
+  it("replaces spaces with underscores (the 403 case)", () => {
+    expect(sanitizeUploadFilename("martinexEric ChDischarge.mp3")).toBe(
+      "martinexEric_ChDischarge.mp3",
+    );
+  });
+
+  it("collapses repeated/odd characters and keeps the extension", () => {
+    expect(sanitizeUploadFilename("John  Doe (visit)#1.m4a")).toBe("John_Doe_visit_1.m4a");
+  });
+
+  it("leaves already-clean names unchanged", () => {
+    expect(sanitizeUploadFilename("recording.wav")).toBe("recording.wav");
+  });
+
+  it("falls back when empty/blank", () => {
+    expect(sanitizeUploadFilename("")).toBe("recording.m4a");
+    expect(sanitizeUploadFilename("   ")).toBe("recording.m4a");
+    expect(sanitizeUploadFilename(null, "note_audio.m4a")).toBe("note_audio.m4a");
   });
 });
 
