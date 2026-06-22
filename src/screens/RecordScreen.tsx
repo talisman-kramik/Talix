@@ -34,8 +34,14 @@ import {
   createEncounter,
   resolveEncounterProviderId,
   uploadEncounterAudio,
+  buildEncounterDetailsFromPatient,
+  formatEncounterDetailsDebugMessage,
+  resolveClientEncounterId,
   fetchEncounterStatus,
   getWsUrl,
+  deriveDefaultVisitType,
+  VISIT_TYPES,
+  formatPatientNameLastFirst,
   ECLIPSE_LOCATION_LABEL,
   type EclipseLocation,
   type PatientSearchResult,
@@ -46,18 +52,21 @@ import { useAuthStore } from "../store/auth";
 import { useProviders } from "../store/providers";
 import {
   getCachedPatients,
-  peekCachedPatients,
   setCachedPatients,
 } from "../store/patientsCache";
 import { findProviderForUser } from "../lib/providerMatch";
 import { formatDateUS } from "../lib/date";
 
-const FRONTEND_PARITY_VISIT_TYPE = "follow_up";
-
 const MODES = [
   { value: "dictation", label: "Dictation" },
   { value: "ambient", label: "Conversation" },
 ];
+
+// Feature flag — live (streaming) transcription. When enabled, recording uses the
+// PCM/WAV streaming path so the live transcript can be shown while recording.
+// When disabled, recording uses the stable HIGH_QUALITY (m4a) path and the SOAP
+// note is generated server-side after upload.
+const LIVE_TRANSCRIPTION_ENABLED = true;
 
 type PipelineStage = "idle" | "recording" | "creating" | "uploading" | "processing" | "complete" | "error";
 
@@ -66,8 +75,12 @@ function normalize(value: unknown): string {
 }
 
 function getPatientDisplayName(patient: Pick<PatientSearchResult, "first_name" | "last_name" | "mrn" | "id">): string {
-  const fullName = `${patient.first_name || ""} ${patient.last_name || ""}`.trim();
-  if (fullName) return fullName;
+  // Display "Last, First" to match the web app's patient list.
+  const first = String(patient.first_name || "").trim();
+  const last = String(patient.last_name || "").trim();
+  if (first && last) return `${last}, ${first}`;
+  const single = last || first;
+  if (single) return single;
   if (patient.mrn) return `MRN: ${patient.mrn}`;
   return patient.id;
 }
@@ -94,32 +107,6 @@ function formatIsoDate(date: Date): string {
 
 function formatDateForDisplay(isoDate: string): string {
   return formatDateUS(isoDate);
-}
-
-function normalizeEncounterIdPart(value: unknown): string {
-  return String(value ?? "")
-    .trim()
-    // Keep backend-identifying chars like "." and "-" from Eclipse IDs.
-    // Only collapse whitespace to avoid unsafe URL spacing.
-    .replace(/\s+/g, "");
-}
-
-function makeClientEncounterId(params: {
-  patientCaseId: string;
-  appointmentId: string;
-  providerId: string;
-  dateOfService: string;
-}): string {
-  const patientCasePart = normalizeEncounterIdPart(params.patientCaseId) || "unknown";
-  const datePart = String(params.dateOfService || "").trim().replace(/-/g, "") || "unknown";
-  let appointmentPart = normalizeEncounterIdPart(params.appointmentId) || "unknown";
-  // If appointment id already includes date_of_service suffix, strip it to
-  // avoid duplicate "..._{date}_{date}" encounter ids.
-  if (appointmentPart.endsWith(`_${datePart}`)) {
-    appointmentPart = appointmentPart.slice(0, -(`_${datePart}`.length));
-  }
-  const providerPart = normalizeEncounterIdPart(params.providerId) || "unknown";
-  return `${patientCasePart}_${appointmentPart}_${providerPart}_${datePart}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +627,14 @@ export default function RecordScreen() {
   const [providerPickerOpen, setProviderPickerOpen] = useState(false);
   const [selectedPatient, setSelectedPatient] = useState<PatientSearchResult | null>(null);
   const [mode, setMode] = useState("ambient");
+  // Provider-selectable Visit Type (Allowed_Visit_Type_Set). Seeded from the
+  // selected patient's `new_repeat_patient` flag via the same default-derivation
+  // helper the web recorder and backend fallback use; re-derived when the
+  // selected patient changes while the recorder is idle (see effect below), and
+  // overridable by explicit provider selection until recording locks it.
+  const [visitType, setVisitType] = useState<string>(() =>
+    deriveDefaultVisitType(selectedPatient?.new_repeat_patient),
+  );
 
   // Recording
   const [recording, setRecording] = useState<Audio.Recording | null>(null);
@@ -686,6 +681,20 @@ export default function RecordScreen() {
   // complete / failed, or the safety cap is reached.
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const statusPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Re-derive the default Visit Type whenever the selected patient changes,
+  // but only while the recorder is idle (not in the Recording_Locked_State).
+  // Once recording has started / completed / is pending upload, the provider's
+  // chosen value is frozen and must not be silently reset by a patient swap.
+  // A provider's explicit selection while idle is preserved until the patient
+  // identity actually changes (the effect keys on the patient id).
+  const selectedPatientId = selectedPatient?.id ?? null;
+  const selectedPatientNewRepeat = selectedPatient?.new_repeat_patient;
+  useEffect(() => {
+    if (stage !== "idle") return;
+    setVisitType(deriveDefaultVisitType(selectedPatientNewRepeat));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPatientId]);
 
   // Offline
   const { isOnline, enqueue, checkConnectivity } = useOfflineStore();
@@ -748,12 +757,12 @@ export default function RecordScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providers, authUserName, authUserEmail]);
 
-  // Patient search — fetch once per provider/date, filter locally. Now
-  // backed by the patientsCache so the picker paints **instantly** from
-  // memory / AsyncStorage when we've seen this (provider, date, location)
-  // combo before, then quietly refreshes in the background. A local
-  // `cancelled` flag prevents a late-arriving response from the previous
-  // provider/date/location from overwriting state after the user switches.
+  // Patient search — always fetch fresh from the Eclipse API on every
+  // provider/date/location change. We deliberately do NOT paint from cache
+  // first: a stale cache occasionally surfaced the previous date's patients
+  // when switching dates. The cache is now used only as an offline fallback
+  // when the network request fails. A local `cancelled` flag prevents a
+  // late-arriving response from a previous selection from overwriting state.
   useEffect(() => {
     setSelectedPatient(null);
     setPatientQuery("");
@@ -768,28 +777,14 @@ export default function RecordScreen() {
 
     let cancelled = false;
 
-    // 1) Synchronous in-memory peek — if we already loaded this combo in
-    //    this app session, paint immediately with zero awaits.
-    const memHit = peekCachedPatients(providerId, appointmentDate, eclipseLocation);
-    if (memHit && memHit.length > 0) {
-      setAllPatients(memHit);
-      setPatients(memHit);
-      setPatientsLoading(false);
-      if (appointmentDate === getEtDateIso()) {
-        const best = findClosestAppointment(memHit, getEtMinutesNow());
-        if (best) setSelectedPatient(best);
-      }
-    } else {
-      // No memory hit — clear stale rows and show the loading state. We may
-      // still get an AsyncStorage hit a few ms later that fills the list.
-      setPatients([]);
-      setAllPatients([]);
-      setPatientsLoading(true);
-    }
+    // Clear any rows from the previous provider/date and show loading. This
+    // guarantees the user never sees the prior selection's patients.
+    setPatients([]);
+    setAllPatients([]);
+    setPatientsLoading(true);
 
-    // Helper: apply a freshly resolved patient list to state + cache, with
-    // optional auto-select for today's schedule. Keeps the two callsites
-    // (cache hit, network refresh) DRY and consistent.
+    // Apply a resolved patient list to state (+ optionally persist to cache),
+    // with auto-select for today's schedule.
     const applyList = (list: PatientSearchResult[], persist: boolean) => {
       const sortedList = [...list].sort((a, b) =>
         normalize(`${a.last_name} ${a.first_name}`).localeCompare(
@@ -801,14 +796,7 @@ export default function RecordScreen() {
       }
       if (cancelled) return;
       setAllPatients(sortedList);
-      // Preserve the user's free-text filter across a background refresh.
-      setPatients((current) => {
-        if (current.length === 0) return sortedList;
-        // If we already had something rendered (cache hit), only update the
-        // full list — the typing-filter effect downstream will reapply the
-        // user's query against the new `allPatients`.
-        return sortedList;
-      });
+      setPatients(sortedList);
       if (appointmentDate === getEtDateIso()) {
         // Don't clobber a manual selection the user already made.
         setSelectedPatient((existing) => {
@@ -819,27 +807,8 @@ export default function RecordScreen() {
     };
 
     (async () => {
-      // 2) AsyncStorage fallback — async but cheap (typically <30 ms).
-      //    Only paints when the mem peek above missed.
-      if (!memHit || memHit.length === 0) {
-        const disk = await getCachedPatients(
-          providerId,
-          appointmentDate,
-          eclipseLocation,
-        );
-        if (cancelled) return;
-        if (disk.status === "fresh" || disk.status === "stale") {
-          applyList(disk.patients, false);
-          setPatientsLoading(false);
-          // "fresh" cache hits skip the network refresh entirely.
-          if (disk.status === "fresh") return;
-        }
-      }
-
-      // 3) Background refresh from Eclipse. We always fire this when there
-      //    was no in-memory hit OR the disk cache was stale — guarantees
-      //    the list is eventually current even if it painted from cache.
       try {
+        // Always go to the API so the list matches the selected date exactly.
         const list = await fetchPatientsByProviderDate(
           providerId,
           appointmentDate,
@@ -850,13 +819,25 @@ export default function RecordScreen() {
         applyList(list, true);
       } catch (err) {
         if (cancelled) return;
-        // Only surface the error when we have nothing else to show. A
-        // background refresh failure that follows a cache paint should be
-        // silent — the cached data is still useful.
-        setPatientLoadError((prev) => {
-          if (allPatients.length > 0) return prev;
-          return err instanceof Error ? err.message : "Failed to load patients";
-        });
+        // Network failure (e.g. offline) — fall back to cached rows for this
+        // exact (provider, date, location) so the screen still works.
+        const disk = await getCachedPatients(
+          providerId,
+          appointmentDate,
+          eclipseLocation,
+        ).catch(() => null);
+        if (cancelled) return;
+        if (
+          disk &&
+          (disk.status === "fresh" || disk.status === "stale") &&
+          disk.patients.length > 0
+        ) {
+          applyList(disk.patients, false);
+        } else {
+          setPatientLoadError(
+            err instanceof Error ? err.message : "Failed to load patients",
+          );
+        }
       } finally {
         if (!cancelled) setPatientsLoading(false);
       }
@@ -865,10 +846,6 @@ export default function RecordScreen() {
     return () => {
       cancelled = true;
     };
-    // allPatients is intentionally excluded from deps — including it would
-    // re-fire the network request every time the list updates (infinite
-    // loop). The effect should only re-run on the actual input keys.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providerId, appointmentDate, apiUrl, eclipseLocation]);
 
   // Local filtering when user types
@@ -996,27 +973,36 @@ export default function RecordScreen() {
         web: {},
       };
       let rec: Audio.Recording | null = null;
-      try {
-        const created = await Audio.Recording.createAsync(liveRecordingOptions);
-        rec = created.recording;
-        liveAsrFormatRef.current = "pcm";
-      } catch {
+      if (!LIVE_TRANSCRIPTION_ENABLED) {
+        // Live transcription disabled: record straight to the stable
+        // HIGH_QUALITY (m4a) preset — the same format used for the working
+        // audio-upload flow. No PCM/WAV streaming, so no live-ASR crash.
+        const stable = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+        rec = stable.recording;
+        liveAsrFormatRef.current = "none";
+      } else {
         try {
-          // Retry after resetting mode; first permission grant can race.
-          await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-          await new Promise((resolve) => setTimeout(resolve, 180));
-          await configureRecordingMode();
-          const createdRetry = await Audio.Recording.createAsync(liveRecordingOptions);
-          rec = createdRetry.recording;
+          const created = await Audio.Recording.createAsync(liveRecordingOptions);
+          rec = created.recording;
           liveAsrFormatRef.current = "pcm";
         } catch {
-          // Fallback to stable preset so recording still works.
-          await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
-          await new Promise((resolve) => setTimeout(resolve, 120));
-          await configureRecordingMode();
-          const fallback = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-          rec = fallback.recording;
-          liveAsrFormatRef.current = "none";
+          try {
+            // Retry after resetting mode; first permission grant can race.
+            await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+            await new Promise((resolve) => setTimeout(resolve, 180));
+            await configureRecordingMode();
+            const createdRetry = await Audio.Recording.createAsync(liveRecordingOptions);
+            rec = createdRetry.recording;
+            liveAsrFormatRef.current = "pcm";
+          } catch {
+            // Fallback to stable preset so recording still works.
+            await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+            await new Promise((resolve) => setTimeout(resolve, 120));
+            await configureRecordingMode();
+            const fallback = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+            rec = fallback.recording;
+            liveAsrFormatRef.current = "none";
+          }
         }
       }
 
@@ -1034,10 +1020,12 @@ export default function RecordScreen() {
       setStage("recording");
       timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
       const recUri = rec.getURI();
-      if (recUri && liveAsrFormatRef.current === "pcm") {
-        startLiveTranscription(recUri, mode);
-      } else if (liveAsrFormatRef.current !== "pcm") {
-        setAsrError("Live transcription unavailable for this recording. Try recording again.");
+      if (LIVE_TRANSCRIPTION_ENABLED) {
+        if (recUri && liveAsrFormatRef.current === "pcm") {
+          startLiveTranscription(recUri, mode);
+        } else if (liveAsrFormatRef.current !== "pcm") {
+          setAsrError("Live transcription unavailable for this recording. Try recording again.");
+        }
       }
     } catch (err) {
       Alert.alert("Error", "Could not start recording.");
@@ -1373,13 +1361,20 @@ export default function RecordScreen() {
     const effectiveNoteAudioUri = notesOverride?.uri ?? noteAudioUri;
     const effectiveNoteAudioFilename = notesOverride?.name ?? noteAudioFilename;
 
+    // Use the provider-selected Visit Type (component `visitType` state). It is
+    // seeded from the patient's `new_repeat_patient` flag via
+    // `deriveDefaultVisitType` and overridable by the provider until recording
+    // locks the selector, so the explicit selection takes precedence over the
+    // legacy `resolveVisitType` auto-derivation at submit time. Always a member
+    // of the Allowed_Visit_Type_Set; the backend re-validates regardless.
+
     // Check connectivity
     const online = await checkConnectivity();
     if (!online) {
       await enqueue({
         provider_id: providerId,
         patient_id: selectedPatient.id,
-          visit_type: FRONTEND_PARITY_VISIT_TYPE,
+          visit_type: visitType,
         mode,
         audioUri: recordingUri,
           filename: audioFilename,
@@ -1402,10 +1397,10 @@ export default function RecordScreen() {
         String(selectedPatient.patient_case_id || "").trim() ||
         String(selectedPatient.mrn || "").trim() ||
         String(selectedPatient.id || "").trim();
-      const patientNameForRequest = `${selectedPatient.first_name || ""} ${selectedPatient.last_name || ""}`.trim();
-      const appointmentId =
-        String(selectedPatient.appointment_id || "").trim() ||
-        String(selectedPatient.id || "").trim();
+      const patientNameForRequest = formatPatientNameLastFirst(
+        selectedPatient.first_name,
+        selectedPatient.last_name,
+      );
       const providerIdCandidate =
         String(selectedPatient.provider_source_id || "").trim() ||
         String(encounterProviderId || "").trim() ||
@@ -1413,11 +1408,12 @@ export default function RecordScreen() {
       const providerIdForEncounter = providerIdCandidate.startsWith("name:")
         ? providerIdCandidate.replace(/^name:/, "")
         : providerIdCandidate;
-      const clientEncounterId = makeClientEncounterId({
+      const clientEncounterId = resolveClientEncounterId({
+        appointmentId: selectedPatient.appointment_id,
         patientCaseId,
-        appointmentId,
         providerId: providerIdForEncounter,
         dateOfService: appointmentDate,
+        location: eclipseLocation,
       });
 
       let enc;
@@ -1427,7 +1423,7 @@ export default function RecordScreen() {
           provider_id: encounterProviderId,
           patient_id: selectedPatient.id,
           patient_name: patientNameForRequest || undefined,
-            visit_type: FRONTEND_PARITY_VISIT_TYPE,
+            visit_type: visitType,
           mode,
           date_of_service: appointmentDate,
           created_at: new Date().toISOString(),
@@ -1447,7 +1443,7 @@ export default function RecordScreen() {
             provider_id: "dr_caleb_ademiloye",
             patient_id: selectedPatient.id,
             patient_name: patientNameForRequest || undefined,
-              visit_type: FRONTEND_PARITY_VISIT_TYPE,
+              visit_type: visitType,
             mode,
             date_of_service: appointmentDate,
             created_at: new Date().toISOString(),
@@ -1496,12 +1492,46 @@ export default function RecordScreen() {
       setStatusMsg("Uploading audio...");
       setProgress(5);
 
+      // Build the demographics blob the AI Scribe pipeline relies on to
+      // route uploads to the correct SFTP / MT folders and to slug the
+      // generated note. Without this the backend can't distinguish a
+      // Pennsylvania run from a Baltimore one — the web app sends the same
+      // payload via its capture flow.
+      const demographics = buildEncounterDetailsFromPatient({
+        patient: selectedPatient,
+        providerName: selectedProviderName || patientNameForRequest || "Unknown",
+        systemLocation: eclipseLocation,
+        date: appointmentDate,
+        visitType,
+      });
+
+      // Set EXPO_PUBLIC_DEBUG_DEMOGRAPHICS=1 in .env — popup before upload (case # + D/ACCIDENT).
+      if (__DEV__ || process.env.EXPO_PUBLIC_DEBUG_DEMOGRAPHICS === "1") {
+        const debugBody = formatEncounterDetailsDebugMessage({
+          demographics,
+          patient: selectedPatient,
+          systemLocation: eclipseLocation,
+        });
+        console.log("[Talix] encounter_details", JSON.stringify(demographics, null, 2));
+        console.log("[Talix] upload debug\n", debugBody);
+        await new Promise<void>((resolve) => {
+          Alert.alert(
+            eclipseLocation === "baltimore"
+              ? "Baltimore upload (debug)"
+              : "Pennsylvania upload (debug)",
+            debugBody,
+            [{ text: "Continue upload", onPress: () => resolve() }],
+          );
+        });
+      }
+
       const result = await uploadEncounterAudio(
         effectiveEncounterId,
         recordingUri,
         audioFilename,
         effectiveNoteAudioUri,
         effectiveNoteAudioFilename,
+        demographics,
       );
 
       setStage("processing");
@@ -1558,6 +1588,8 @@ export default function RecordScreen() {
     recordingUri,
     mode,
     stage,
+    eclipseLocation,
+    visitType,
     checkConnectivity,
     enqueue,
     audioFilename,
@@ -1964,6 +1996,37 @@ export default function RecordScreen() {
             })}
           </View>
         </View>
+
+        <View style={{ marginTop: spacing.md }}>
+          <Text style={styles.sublabel}>Visit Type</Text>
+          <View style={styles.modeOptionsRow}>
+            {VISIT_TYPES.map((vt) => {
+              const active = visitType === vt.value;
+              // Locked once recording starts / completes / is pending upload —
+              // mirrors the recording-locked condition used elsewhere on this
+              // screen (stage !== "idle").
+              const locked = stage !== "idle";
+              return (
+                <TouchableOpacity
+                  key={vt.value}
+                  onPress={() => setVisitType(vt.value)}
+                  disabled={locked}
+                  style={[
+                    styles.modeOptionCard,
+                    active && styles.modeOptionCardActive,
+                    locked && styles.modeOptionCardDisabled,
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active, disabled: locked }}
+                >
+                  <Text style={[styles.modeOptionTitle, active && styles.modeOptionTitleActive]}>
+                    {vt.label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </View>
       </Card>
 
       {/* Audio recording */}
@@ -2130,7 +2193,8 @@ export default function RecordScreen() {
             )}
           </View>
         ) : null}
-        {stage === "recording" &&
+        {LIVE_TRANSCRIPTION_ENABLED &&
+          stage === "recording" &&
           (asrStreaming ||
             asrPartialText ||
             asrFinalSegments.length > 0 ||
@@ -2376,6 +2440,9 @@ const styles = StyleSheet.create({
   modeOptionCardActive: {
     borderColor: colors.brand,
     backgroundColor: "#ECFDF5",
+  },
+  modeOptionCardDisabled: {
+    opacity: 0.5,
   },
   modeOptionTitle: {
     fontSize: fontSize.sm,

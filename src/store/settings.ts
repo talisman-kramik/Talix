@@ -1,12 +1,12 @@
 /**
  * Settings store — persists API URL and API key via AsyncStorage.
  *
- * The app talks to the **provider-facing** API (port 8000) or, for lab / GPU-only
- * setups, the **processing-pipeline** API (port 8100) — same REST surface for
- * encounters, providers, patients when both are configured.
+ * Mobile uses **AI Scribe on port 8100** (encounters, upload). Provider/patient
+ * lists and demographics (DOB, provider id, injury date) come from the public
+ * Eclipse API only — not internal web SQL routes.
  *
  * Optional defaults via .env (loaded at `expo start`):
- *   EXPO_PUBLIC_AI_SCRIBE_API_URL  — backend base URL
+ *   EXPO_PUBLIC_AI_SCRIBE_API_URL  — backend base URL (typically :8100)
  *   EXPO_PUBLIC_AI_SCRIBE_API_KEY  — Bearer token for the new API key auth middleware
  */
 import { create } from "zustand";
@@ -16,7 +16,7 @@ import Constants from "expo-constants";
 import type { EclipseLocation } from "../lib/api";
 
 const STORAGE_KEY = "ai_scribe_settings";
-const PROVIDER_SERVER_PORT = "8000";
+const AI_SCRIBE_SERVER_PORT = "8100";
 const DEFAULT_ECLIPSE_LOCATION: EclipseLocation = "pennsylvania";
 
 function parseEclipseLocation(value: unknown): EclipseLocation | null {
@@ -27,8 +27,8 @@ function parseEclipseLocation(value: unknown): EclipseLocation | null {
  * Derive a sensible default API URL.
  *
  * 1) `extra.apiUrl` from app.config.js (from EXPO_PUBLIC_AI_SCRIBE_API_URL)
- * 2) During Expo dev: LAN host from Metro + port 8000
- * 3) Fallback: localhost:8000
+ * 2) During Expo dev: LAN host from Metro + port 8100
+ * 3) Fallback: localhost:8100
  */
 function getDefaultApiUrl(): string {
   const fromConfig = Constants.expoConfig?.extra?.apiUrl;
@@ -38,9 +38,9 @@ function getDefaultApiUrl(): string {
   const hostUri = Constants.expoConfig?.hostUri; // e.g. "192.168.1.42:8081"
   if (hostUri) {
     const host = hostUri.split(":")[0]; // strip Expo port
-    return `http://${host}:${PROVIDER_SERVER_PORT}`;
+    return `http://${host}:${AI_SCRIBE_SERVER_PORT}`;
   }
-  return `http://localhost:${PROVIDER_SERVER_PORT}`;
+  return `http://localhost:${AI_SCRIBE_SERVER_PORT}`;
 }
 
 export const DEFAULT_API_URL = getDefaultApiUrl();
@@ -66,12 +66,19 @@ interface SettingsState {
 /** Default API key from build-time env var (set in .env as EXPO_PUBLIC_AI_SCRIBE_API_KEY) */
 const DEFAULT_API_KEY = (process.env.EXPO_PUBLIC_AI_SCRIBE_API_KEY ?? "").trim();
 
-function persist(state: Pick<SettingsState, "apiUrl" | "apiKey" | "eclipseLocation">) {
+/**
+ * Persist only the Eclipse location.
+ *
+ * The API URL and key are intentionally **not** persisted. They come straight
+ * from the build-time env (EXPO_PUBLIC_AI_SCRIBE_API_URL / _API_KEY via
+ * eas.json / .env), so the value you ship in a build is always the value the
+ * app uses. Persisting the URL previously caused stale dev URLs to "stick"
+ * across rebuilds (a saved dev URL would override a freshly-built prod env).
+ */
+function persist(state: Pick<SettingsState, "eclipseLocation">) {
   AsyncStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
-      apiUrl: state.apiUrl,
-      apiKey: state.apiKey,
       eclipseLocation: state.eclipseLocation,
     }),
   );
@@ -83,29 +90,26 @@ export const useSettings = create<SettingsState>((set, get) => ({
   eclipseLocation: DEFAULT_ECLIPSE_LOCATION,
   loaded: false,
   configured: false,
+  // In-memory only override for the current session (not persisted, so the
+  // build-time env always wins on the next launch).
   setApiUrl: (url: string) => {
     set({ apiUrl: url, configured: true });
-    const { apiKey, eclipseLocation } = get();
-    persist({ apiUrl: url, apiKey, eclipseLocation });
   },
   setApiKey: (key: string) => {
     set({ apiKey: key });
-    const { apiUrl, eclipseLocation } = get();
-    persist({ apiUrl, apiKey: key, eclipseLocation });
   },
   setEclipseLocation: (location: EclipseLocation) => {
     set({ eclipseLocation: location });
-    const { apiUrl, apiKey } = get();
-    persist({ apiUrl, apiKey, eclipseLocation: location });
+    persist({ eclipseLocation: location });
   },
   load: async () => {
     try {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (parsed.apiUrl) set({ apiUrl: parsed.apiUrl, configured: true });
-        // Prefer persisted key; fall back to build-time env default
-        if (parsed.apiKey) set({ apiKey: parsed.apiKey });
+        // Only the Eclipse location is restored. apiUrl/apiKey are always
+        // taken from the build-time env defaults set above — any legacy
+        // persisted apiUrl/apiKey is ignored on purpose.
         const location = parseEclipseLocation(parsed.eclipseLocation);
         if (location) set({ eclipseLocation: location });
       }
@@ -130,3 +134,4 @@ export function getApiKey(): string {
 export function getEclipseLocation(): EclipseLocation {
   return useSettings.getState().eclipseLocation;
 }
+

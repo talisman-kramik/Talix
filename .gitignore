@@ -45,3 +45,4 @@ yarn-error.*
 test-output/
 scripts/
 docs/
+eas.json

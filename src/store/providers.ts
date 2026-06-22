@@ -40,7 +40,7 @@ const SWITCH_DEBOUNCE_MS = 300;
 // can paint the new dropdown instantly from the other location's cache,
 // instead of wiping the list and showing a spinner while the network
 // call runs. Bump the version suffix if the persisted shape ever changes.
-const PROVIDERS_CACHE_KEY_PREFIX = "providers.cache.v2:";
+const PROVIDERS_CACHE_KEY_PREFIX = "providers.cache.v5:";
 function providersCacheKey(location: EclipseLocation): string {
   return `${PROVIDERS_CACHE_KEY_PREFIX}${location}`;
 }
