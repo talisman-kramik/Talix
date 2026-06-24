@@ -306,6 +306,12 @@ export default function EncounterDetailScreen({ route }: any) {
     setSmartEditOpen(false);
   };
 
+  const showSmartEditPanel =
+    smartEditOpen &&
+    (amendLifecycle.phase === "idle" ||
+      amendLifecycle.phase === "loading" ||
+      amendLifecycle.phase === "error");
+
   const handleAmendRejected = () => {
     void amendRecorder.reset();
   };
@@ -435,7 +441,7 @@ export default function EncounterDetailScreen({ route }: any) {
       </ScrollView>
 
       <SmartEditPanel
-        visible={smartEditOpen}
+        visible={showSmartEditPanel}
         onClose={closeSmartEdit}
         lifecycle={amendLifecycle}
         recorder={amendRecorder}
